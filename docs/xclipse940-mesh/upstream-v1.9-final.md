@@ -70,7 +70,9 @@ extension advertisement alone:
 Neither caveat proves the E4a `13,1,1` draw will fail. They are reasons to avoid
 unqualified support claims and to add synthetic boundary tests before upstream
 conformance acceptance. Other untested semantics, queries and multi-queue
-sharing still require review/validation.
+sharing still require review/validation. The two concrete source findings were
+[reported once on issue #23](https://github.com/JimVulkan/radv-xclipse/issues/23#issuecomment-6809501095),
+explicitly distinguished from unperformed device tests.
 
 ## Coordinated next test (requires owner action)
 
