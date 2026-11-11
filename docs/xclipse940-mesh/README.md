@@ -68,7 +68,21 @@ changes. Restore any changed diagnostic properties afterward.
 
 ## Status
 
-Pristine baseline [run 43114700647](https://github.com/vscunha/radv-xclipse/actions/runs/43114700647)
-passed build and static verification. See [A1 investigation and test plan](experiment-a1.md)
-for provenance, source findings and the first diagnostic-only experiment.
-Device acceptance is pending. No fix or root cause is claimed.
+**Next recommended device candidate:** upstream has now published **1.9 final
+`cc87fdf`, packageVersion 20**, with task/mesh emulation. It is not RC1.
+Read the [source review, verified official ZIP checksum and coordinated test](upstream-v1.9-final.md)
+before spending another hang on A1. No phone result is claimed.
+
+Completed local/CI deliverables:
+
+- Pristine baseline [run 43114700647](https://github.com/vscunha/radv-xclipse/actions/runs/43114700647)
+  and [permanent ZIP/checksum](https://github.com/vscunha/radv-xclipse/releases/tag/x940-baseline-43114700647).
+- Diagnostic-only A1 [run 43116572844](https://github.com/vscunha/radv-xclipse/actions/runs/43116572844)
+  and [ZIP/checksum/source patch](https://github.com/vscunha/radv-xclipse/releases/tag/x940-a1-43116572844).
+- Both compiled on GitHub Ubuntu x86-64 with NDK r29, passed static verification,
+  and have downloaded/checksummed artifacts. [A1 details](experiment-a1.md).
+- Official 1.8/1.9 RC1 rollback ZIPs preserved separately.
+
+**Objective incomplete:** physical-device execution, rendering and five-minute
+performance/memory acceptance remain open. No experimental fix or verified
+940 root cause is claimed. Default and upstream branches were not modified.

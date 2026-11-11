@@ -1,6 +1,21 @@
 # A1: direct task/mesh recording versus kernel gang-submit acceptance
 
-**Diagnostic experiment, not a fix. Device result: pending.**
+**Diagnostic experiment, not a fix. Device result: not run.**
+
+A1 now passed [Actions run 43116572844](https://github.com/vscunha/radv-xclipse/actions/runs/43116572844)
+(build/verification 198s; job 3m51s), with no new compiler warnings.
+Source: `9569c8ef1cb6c618ca66da819be9fb4c748b115c`; diagnostic code commit
+[`cc56321929b8`](https://github.com/vscunha/radv-xclipse/commit/cc56321929b8bfd09971f18644528f10dc534e55).
+[ZIP, checksum, verification JSON and source patch](https://github.com/vscunha/radv-xclipse/releases/tag/x940-a1-43116572844):
+`radv-xclipse-experiment-43116572844-1-9569c8e.zip`, SHA-256
+`b47f2a80e869fbd25615cf538a686cb515d9de9c2bca8dbf4de2ec13c729ec91`.
+Downloaded checksums/static checks passed; AArch64 API34/r29 library is
+17,994,904 bytes. No GPU correctness result is implied.
+
+**Superseded as the first phone test:** upstream has now released an actual
+emulation candidate. Read [the updated recommendation](upstream-v1.9-final.md)
+first; retain A1 for causal diagnosis only if useful. Do not repeat E0–E4a
+with old execution paths unnecessarily.
 
 ## Baseline gate completed
 
