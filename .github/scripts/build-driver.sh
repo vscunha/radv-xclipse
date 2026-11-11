@@ -15,7 +15,7 @@ finish() {
   if [[ -f "$OUT/logs/build.log" ]]; then
     rg -n -i 'warning:|deprecated|WARNING:' "$OUT/logs/build.log" > "$OUT/logs/warnings.txt" || :
   fi
-  if [[ -f "$GITHUB_STEP_SUMMARY" || -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+  if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
     {
       echo "## $VARIANT / $CODE_SHA"
       echo "Build and verification exit status: $status; elapsed: $(( $(date +%s) - START )) seconds."
@@ -39,10 +39,12 @@ git -C "$SOURCE" diff --exit-code HEAD --
   echo "run_attempt=$GITHUB_RUN_ATTEMPT"
   echo "runner_os=$RUNNER_OS runner_arch=$RUNNER_ARCH runner_image=${ImageOS:-unknown}/${ImageVersion:-unknown}"
   uname -a
+  nproc
   cat "$ANDROID_NDK_HOME/source.properties"
   "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/clang" --version
   meson --version
-  ninja --version
+  printf 'build_ninja_version='; /usr/bin/ninja --version
+  printf 'path_ninja_version='; ninja --version
   glslangValidator --version
   python --version
   python -m pip freeze

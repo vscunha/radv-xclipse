@@ -25,7 +25,7 @@ jobs:
     timeout-minutes: 45
     env:
       NDK_VERSION: 29.0.14206865
-      VARIANT: ${{ inputs.variant || 'baseline' }}
+      VARIANT: ${{ inputs.variant || 'experiment' }}
       PYTHONUNBUFFERED: '1'
     steps:
       - name: Check out build orchestration
