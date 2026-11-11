@@ -25,6 +25,7 @@
 #include <android/log.h>
 #include "radv_amdgpu_winsys.h"
 #include "radv_radeon_winsys.h"
+#include "radv_xclipse_mesh_diag.h"
 #include "vk_xclipse_perf.h"
 #include "sid.h"
 #include "vk_drm_syncobj.h"
@@ -1999,6 +2000,33 @@ radv_xclipse_pace_end(struct radv_amdgpu_ctx *ctx, const struct radv_amdgpu_cs_r
    p->count = signal_point;
 }
 
+/* Metadata only: no BO contents, GPU virtual addresses, handles, or shader code.
+ * A successful ioctl means kernel acceptance, not GPU completion.
+ */
+static void
+radv_xclipse_mesh_diag_submit(const struct radv_amdgpu_ctx *ctx,
+                             const struct radv_amdgpu_cs_request *request, unsigned id,
+                             unsigned num_chunks, bool user_fence)
+{
+   const struct radeon_info *info = &ctx->ws->info;
+   fprintf(stderr,
+           "[X940-MESH-A] submit=%u enter leader_ip=%u ring=%u ibs=%u chunks=%u bos=%u "
+           "user_fence=%u timeline=%u mec_fw=%u gfx_level=%u shadercore11=%u\n",
+           id, request->ip_type, request->ring, request->number_of_ibs, num_chunks,
+           request->num_handles, user_fence, info->has_timeline_syncobj, info->mec_fw_version,
+           info->gfx_level, info->gfx11_shader_core);
+   for (unsigned i = 0; i < request->number_of_ibs && i < 32; ++i) {
+      const struct radv_amdgpu_cs_ib_info *ib = &request->ibs[i];
+      fprintf(stderr,
+              "[X940-MESH-A] submit=%u ib=%u ip=%u ring=%u dwords=%u flags=0x%llx queues_for_ip=%u\n",
+              id, i, ib->ip_type, request->ring, ib->size, (unsigned long long)ib->flags,
+              info->ip[ib->ip_type].num_queues);
+   }
+   if (request->number_of_ibs > 32)
+      fprintf(stderr, "[X940-MESH-A] submit=%u remaining_ib_metadata_omitted=%u\n",
+              id, request->number_of_ibs - 32);
+}
+
 static VkResult
 radv_amdgpu_cs_submit(struct radv_amdgpu_ctx *ctx, struct radv_amdgpu_cs_request *request,
                       struct radv_winsys_sem_info *sem_info)
@@ -2148,6 +2176,23 @@ radv_amdgpu_cs_submit(struct radv_amdgpu_ctx *ctx, struct radv_amdgpu_cs_request
    const bool xperf = vk_xclipse_perf_enabled();
    const uint64_t xperf_t0 = xperf ? os_time_get_nano() : 0;
 
+   unsigned diag_id = 0;
+   bool diag_trace = false;
+   const bool diag = ctx->ws->info.xclipse_model == AC_XCLIPSE_940 &&
+                     debug_get_option_xclipse_mesh_diag();
+   if (diag) {
+      static unsigned ids, gangs;
+      bool gfx = false, compute = false;
+      for (unsigned ib = 0; ib < request->number_of_ibs; ++ib) {
+         gfx |= request->ibs[ib].ip_type == AMD_IP_GFX;
+         compute |= request->ibs[ib].ip_type == AMD_IP_COMPUTE;
+      }
+      diag_id = p_atomic_inc_return(&ids);
+      diag_trace = diag_id <= 4 || (gfx && compute && p_atomic_inc_return(&gangs) <= 16);
+      if (diag_trace)
+         radv_xclipse_mesh_diag_submit(ctx, request, diag_id, num_chunks, has_user_fence);
+   }
+
    r = 0;
    do {
       /* Wait 1 ms and try again. */
@@ -2156,6 +2201,13 @@ radv_amdgpu_cs_submit(struct radv_amdgpu_ctx *ctx, struct radv_amdgpu_cs_request
 
       r = ac_drm_cs_submit_raw2(ctx->ws->dev, ctx->ctx_handle, 0, num_chunks, chunks, &request->seq_no);
    } while (r == -ENOMEM && os_time_get_nano() < abs_timeout_ns);
+
+   if (diag && (diag_trace || r)) {
+      if (!diag_trace)
+         radv_xclipse_mesh_diag_submit(ctx, request, diag_id, num_chunks, has_user_fence);
+      fprintf(stderr, "[X940-MESH-A] submit=%u ioctl_return=%d accepted=%u sequence=%llu (not GPU completion)\n",
+              diag_id, r, !r, r ? 0ull : (unsigned long long)request->seq_no);
+   }
 
    if (xperf)
       vk_xclipse_perf_submit(os_time_get_nano() - xperf_t0);

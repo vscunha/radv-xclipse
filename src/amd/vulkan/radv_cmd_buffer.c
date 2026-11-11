@@ -53,6 +53,7 @@
 #include "util/fast_idiv_by_const.h"
 #include "util/perf/u_trace.h"
 #include "radv_xclipse_prof.h"
+#include "radv_xclipse_mesh_diag.h"
 
 enum {
    RADV_PREFETCH_VS = (1 << 0),
@@ -12840,6 +12841,48 @@ radv_emit_direct_taskmesh_draw_packets(const struct radv_device *device, struct 
 {
    const struct radv_physical_device *pdev = radv_device_physical(device);
    const uint32_t view_mask = cmd_state->render.view_mask;
+
+   /* Recording evidence only: a recorded packet is not evidence of GPU execution.
+    * Keep E4a's direct dispatch intact; do not conflate it with indirect-count-zero.
+    */
+   if (pdev->info.xclipse_model == AC_XCLIPSE_940 && debug_get_option_xclipse_mesh_diag()) {
+      static unsigned recorded;
+      const unsigned n = p_atomic_inc_return(&recorded);
+      if (n <= 16) {
+         const struct radv_shader *task = cmd_state->shaders[MESA_SHADER_TASK];
+         const struct radv_shader *mesh = cmd_state->shaders[MESA_SHADER_MESH];
+         const uint32_t initiator = device->dispatch_initiator_task |
+                                    S_00B800_CS_W32_EN(task->info.wave_size == 32);
+         fprintf(stderr,
+                 "[X940-MESH-A] record direct=%u groups=%u,%u,%u views=0x%x predicated=%u "
+                 "gfx_ip=%u ace_ip=%u mec_fw=%u gfx_level=%u shadercore11=%u indirect0_bug=%u\n",
+                 n, x, y, z, view_mask, cmd_state->cond_render.enabled, cs->hw_ip, ace_cs->hw_ip,
+                 pdev->info.mec_fw_version, pdev->info.gfx_level, pdev->info.gfx11_shader_core,
+                 pdev->info.has_taskmesh_indirect0_bug);
+         fprintf(stderr,
+                 "[X940-MESH-A] direct=%u task_local=%u,%u,%u mesh_local=%u,%u,%u "
+                 "task_wave=%u mesh_wave=%u task_vgprs=%u task_sgprs=%u task_lds_bytes=%u "
+                 "task_scratch_per_wave=%u mesh_vgprs=%u mesh_sgprs=%u mesh_lds_bytes=%u "
+                 "mesh_scratch_per_wave=%u\n",
+                 n, task->info.cs.block_size[0], task->info.cs.block_size[1], task->info.cs.block_size[2],
+                 mesh->info.cs.block_size[0], mesh->info.cs.block_size[1], mesh->info.cs.block_size[2],
+                 task->info.wave_size, mesh->info.wave_size, task->config.num_vgprs, task->config.num_sgprs,
+                 task->config.lds_size, task->config.scratch_bytes_per_wave,
+                 mesh->config.num_vgprs, mesh->config.num_sgprs, mesh->config.lds_size,
+                 mesh->config.scratch_bytes_per_wave);
+         fprintf(stderr,
+                 "[X940-MESH-A] direct=%u ace_header=0x%08x initiator=0x%08x "
+                 "task_ring_sgpr=%u gfx_header=0x%08x mesh_ring_sgpr=%u "
+                 "ring_entries=%u payload_entry_bytes=%u draw_ring_offset=%u "
+                 "payload_ring_offset=%u task_ring_bytes=%u\n",
+                 n, PKT3(PKT3_DISPATCH_TASKMESH_DIRECT_ACE, 4, cmd_state->cond_render.enabled) |
+                       PKT3_SHADER_TYPE_S(1), initiator, radv_get_user_sgpr(task, AC_UD_TASK_RING_ENTRY),
+                 PKT3(PKT3_DISPATCH_TASKMESH_GFX, 2, cmd_state->cond_render.enabled) | PKT3_RESET_FILTER_CAM_S(1),
+                 radv_get_user_sgpr(mesh, AC_UD_TASK_RING_ENTRY), pdev->task_info.num_entries,
+                 pdev->task_info.payload_entry_size, pdev->task_info.draw_ring_offset,
+                 pdev->task_info.payload_ring_offset, pdev->task_info.bo_size_bytes);
+      }
+   }
 
    uint32_t *ace_predication = radv_cs_begin_compute_predication(device, cmd_state, ace_cs);
 
