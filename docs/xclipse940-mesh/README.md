@@ -68,5 +68,7 @@ changes. Restore any changed diagnostic properties afterward.
 
 ## Status
 
-Baseline workflow prepared; build verification and device acceptance pending.
-No driver source modifications yet. No fix or root cause is claimed.
+Pristine baseline [run 43114700647](https://github.com/vscunha/radv-xclipse/actions/runs/43114700647)
+passed build and static verification. See [A1 investigation and test plan](experiment-a1.md)
+for provenance, source findings and the first diagnostic-only experiment.
+Device acceptance is pending. No fix or root cause is claimed.
