@@ -37,6 +37,7 @@
 #include "radv_pipeline_rt.h"
 #include "radv_video.h"
 #include "radv_wsi.h"
+#include "radv_xclipse_mesh_diag.h"
 
 #ifdef _WIN32
 typedef void *drmDevicePtr;
@@ -439,9 +440,10 @@ static bool
 radv_xclipse_knob_is_diagnostic(const char *entry)
 {
    static const char *const diag[] = {
-      "RADV_XCLIPSE_LOG",     "debug.radv_xclipse_log",
-      "RADV_XCLIPSE_PERF",    "debug.radv_xclipse_perf",
-      "RADV_XCLIPSE_PERF_MS", "debug.radv_xclipse_perf_ms",
+      "RADV_XCLIPSE_LOG",       "debug.radv_xclipse_log",
+      "RADV_XCLIPSE_PERF",      "debug.radv_xclipse_perf",
+      "RADV_XCLIPSE_PERF_MS",   "debug.radv_xclipse_perf_ms",
+      "RADV_XCLIPSE_MESH_DIAG",
    };
    const size_t len = strcspn(entry, "=");
    for (unsigned i = 0; i < ARRAY_SIZE(diag); i++) {
@@ -3313,6 +3315,21 @@ radv_physical_device_try_create(struct radv_instance *instance, drmDevicePtr drm
 
    ac_get_task_info(&pdev->info, &pdev->task_info);
    radv_get_binning_settings(pdev, &pdev->binning_settings);
+
+   if (radv_xclipse_mesh_diag_level() > 0) {
+      const uint32_t entries = pdev->task_info.num_entries;
+      fprintf(stderr,
+              "[X940-19] DEV emul=%d xclipse=%d gfx=%d family=%d entries=%u max=%u draw_off=%u payload_off=%u "
+              "payload_entry=%u bo_size=%u\n",
+              pdev->xclipse_taskmesh_emul, pdev->info.xclipse_model, pdev->info.gfx_level, pdev->info.family,
+              entries, entries ? entries - 1 : 0, pdev->task_info.draw_ring_offset,
+              pdev->task_info.payload_ring_offset, pdev->task_info.payload_entry_size,
+              pdev->task_info.bo_size_bytes);
+      if (entries < 2)
+         RADV_XCLIPSE_MESH_DIAG_WARN("task ring has %u entries; no room for the indirect count entry\n", entries);
+      else if (entries & (entries - 1))
+         RADV_XCLIPSE_MESH_DIAG_WARN("task ring entries=%u is not a power of two\n", entries);
+   }
 
    if (pdev->info.has_distributed_tess) {
       if (pdev->info.family == CHIP_FIJI || pdev->info.family >= CHIP_POLARIS10)

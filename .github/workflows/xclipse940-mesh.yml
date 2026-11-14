@@ -1,0 +1,86 @@
+name: Xclipse 940 mesh driver
+
+on:
+  push:
+    branches: [diag/1.9-emulation]
+    paths: ['.github/**', 'src/**', 'include/**', 'subprojects/**', 'meson*', 'build.sh', 'android/**']
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: 'baseline builds pristine fe9b894; diag19 builds this branch on v1.9.0 with diagnostics'
+        type: choice
+        options: [baseline, diag19]
+        default: diag19
+
+permissions:
+  contents: read
+
+concurrency:
+  group: xclipse940-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  driver:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      NDK_VERSION: 29.0.14206865
+      VARIANT: ${{ inputs.variant || 'diag19' }}
+      PYTHONUNBUFFERED: '1'
+    steps:
+      - name: Check out build orchestration
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: control
+          persist-credentials: false
+      - name: Select driver revision
+        id: source
+        shell: bash
+        run: |
+          if [[ "$VARIANT" == baseline ]]; then
+            echo 'ref=fe9b8943aaeec11ed9fccbfcc382da07379afbe5' >> "$GITHUB_OUTPUT"
+          else
+            echo "ref=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Check out driver (baseline has no source patches)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ steps.source.outputs.ref }}
+          path: driver
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: Install Android SDK command-line tools and NDK r29
+        uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
+        with:
+          packages: 'ndk;29.0.14206865'
+          log-accepted-android-sdk-licenses: false
+      - name: Install host tools
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ninja-build glslang-tools pkg-config bison flex curl unzip ripgrep
+          python -m pip install meson==1.9.1 Mako==1.3.10 packaging==25.0 PyYAML==6.0.2
+          echo "ANDROID_NDK_HOME=${ANDROID_HOME:-$ANDROID_SDK_ROOT}/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+      - name: Cache checksum-verified Meson source downloads only
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: driver/subprojects/packagecache
+          key: mesa-wraps-v1-${{ runner.os }}-${{ hashFiles('driver/subprojects/*.wrap', 'driver/subprojects/packagefiles/**') }}
+      - name: Build, package, and verify
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash control/.github/scripts/build-driver.sh "$GITHUB_WORKSPACE/driver" "$GITHUB_WORKSPACE/output"
+      - name: Retain logs and packages (7 days)
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: radv-xclipse-${{ env.VARIANT }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: output/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 6

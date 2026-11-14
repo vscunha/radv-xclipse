@@ -27,6 +27,7 @@
 #include "ac_descriptors.h"
 #include "amdgfxregs.h"
 #include "radv_logcat.h"
+#include "radv_xclipse_mesh_diag.h"
 #include "ac_xclipse_ctxinit.h"
 #include "util/os_time.h"
 #include "util/u_xclipse_prof.h"
@@ -283,6 +284,17 @@ radv_xclipse_task_bo(struct radv_device *device)
                                     RADV_BO_PRIORITY_SCRATCH, 0, true, &bo);
    if (result != VK_SUCCESS)
       return NULL;
+
+   if (radv_xclipse_mesh_diag_level() > 0) {
+      const uint64_t va = radv_buffer_get_va(bo);
+      fprintf(stderr,
+              "[X940-19] RING bo=%p va=0x%llx size=%u entries=%u draw_off=%u draw_va=0x%llx payload_off=%u "
+              "payload_va=0x%llx payload_entry=%u\n",
+              (void *)bo, (unsigned long long)va, pdev->task_info.bo_size_bytes, (unsigned)pdev->task_info.num_entries,
+              pdev->task_info.draw_ring_offset,
+              (unsigned long long)(va + pdev->task_info.draw_ring_offset), pdev->task_info.payload_ring_offset,
+              (unsigned long long)(va + pdev->task_info.payload_ring_offset), pdev->task_info.payload_entry_size);
+   }
 
    uint32_t *map = radv_buffer_map(device->ws, bo);
    if (!map) {
