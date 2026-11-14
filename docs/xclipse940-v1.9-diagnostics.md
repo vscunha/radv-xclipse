@@ -25,6 +25,11 @@ complete trace.
 The switch is excluded from the shader-cache knob hash, so enabling it does not
 invalidate cached shaders. Filter the native log for `[X940-19]`.
 
+The GitHub Actions artifact is a wrapper, not the installable driver. Import
+the `packages/*.zip` file inside it; that package has exactly `meta.json`,
+`vulkan.radeon.so`, and `NOTICE.txt` at its root. Do not import the Actions
+artifact ZIP itself.
+
 ## Lines to look for
 
 - `DEV emul=... entries=... max=...` — task draw ring size. `max` is one less
