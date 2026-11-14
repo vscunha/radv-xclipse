@@ -15,6 +15,12 @@ def sha(data):
     return hashlib.sha256(data).hexdigest()
 
 
+def normalized_notice(data):
+    # GitHub's official Windows-built ZIP stores the same NOTICE text with CRLF;
+    # compare the license text, not the checkout's line endings.
+    return data.replace(b"\r\n", b"\n")
+
+
 def inspect(package, directory, readelf):
     with zipfile.ZipFile(package) as z:
         assert sorted(z.namelist()) == ["NOTICE.txt", "meta.json", "vulkan.radeon.so"], z.namelist()
@@ -76,9 +82,9 @@ def main():
     a = p.parse_args()
     out = Path(a.out)
     built, blob, notice = inspect(a.package, out / "verification/built", a.readelf)
-    reference, _, _ = inspect(a.reference, out / "verification/official", a.readelf)
+    reference, _, reference_notice = inspect(a.reference, out / "verification/official", a.readelf)
     assert built["needed"] == reference["needed"], (built["needed"], reference["needed"])
-    assert built["notice_sha256"] == reference["notice_sha256"], "license notices differ"
+    assert normalized_notice(notice) == normalized_notice(reference_notice), "license notices differ"
     for key in ("schemaVersion", "author", "vendor", "driverVersion", "minApi", "libraryName"):
         assert built["metadata"][key] == reference["metadata"][key], key
     assert a.variant == "diag19", f"unsupported variant {a.variant}"
