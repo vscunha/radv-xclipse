@@ -596,14 +596,17 @@ radv_xclipse_convert_mesh_tasks(struct radv_cmd_buffer *cmd_buffer, uint64_t src
 
    radv_meta_bind_compute_pipeline(cmd_buffer, pipeline);
 
-   static unsigned conv_cs_n;
+   static _Thread_local unsigned conv_cs_n;
    if (radv_xclipse_mesh_diag_level() > 0 && radv_xclipse_mesh_diag_sample(&conv_cs_n))
       RADV_XCLIPSE_MESH_DIAG(2,
                              "CONV-CS task=%d src=0x%llx stride=%u count_va=0x%llx max=%u dst=0x%llx\n", task,
                              (unsigned long long)src_va, stride, (unsigned long long)count_va, max_count,
                              (unsigned long long)dst_va);
-   if (!max_count)
+   static _Thread_local bool warned_zero;
+   if (!max_count && !warned_zero) {
+      warned_zero = true;
       RADV_XCLIPSE_MESH_DIAG_WARN("mesh task conversion dispatched with max_count=0\n");
+   }
 
    const uint32_t constants[9] = {
       src_va, src_va >> 32, dst_va, dst_va >> 32, count_va, count_va >> 32, stride, max_count, task,

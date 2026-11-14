@@ -81,20 +81,16 @@ def main():
     assert built["notice_sha256"] == reference["notice_sha256"], "license notices differ"
     for key in ("schemaVersion", "author", "vendor", "driverVersion", "minApi", "libraryName"):
         assert built["metadata"][key] == reference["metadata"][key], key
-    if a.variant == "baseline":
-        assert built["metadata"] == reference["metadata"], "pristine baseline metadata mismatch"
+    assert a.variant == "diag19", f"unsupported variant {a.variant}"
     code = subprocess.check_output(["git", "-C", a.source, "rev-parse", "HEAD"], text=True).strip()
     build_id = f"{a.variant}-{os.environ['GITHUB_RUN_ID']}-{os.environ['GITHUB_RUN_ATTEMPT']}"
-    is_diag = a.variant == 'diag19'
-    label = '1.9 DIAGNOSTIC' if is_diag else 'EXPERIMENTAL'
+    label = '1.9 DIAGNOSTIC'
     meta = dict(built["metadata"])
     meta.update(
         name=f"RADV Xclipse {label} {build_id} ({code[:7]})",
         description=(
             f"v1.9.0 (cc87fdf) plus opt-in task/mesh emulation diagnostics; source {code}; {build_id}. "
             "NOT device-validated. Based on JimVulkan RADV Xclipse."
-            if is_diag else
-            f"Experimental source build of {code}; {build_id}. NOT device-validated. Based on JimVulkan RADV Xclipse."
         ),
         codeCommit=code,
         upstreamCommit='cc87fdf71267dd0acc3b470920a6566a1a46f0be',

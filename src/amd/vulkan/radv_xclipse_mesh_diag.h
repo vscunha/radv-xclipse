@@ -8,9 +8,9 @@
  *
  * RADV_XCLIPSE_MESH_DIAG=0  off (default)
  * RADV_XCLIPSE_MESH_DIAG=1  device/ring/pipeline info, sampled app-draw
- *                           summaries, and every warning
- * RADV_XCLIPSE_MESH_DIAG=2  also each ring pass, indirect conversion and
- *                           DRAW_INDIRECT_MULTI packet argument
+ *                           summaries, and rate-limited warnings
+ * RADV_XCLIPSE_MESH_DIAG=2  also sampled ring passes, indirect conversions
+ *                           and DRAW_INDIRECT_MULTI packet arguments
  *
  * Lines are prefixed with "[X940-19]" so they can be filtered from a full
  * BananaNative log.
@@ -30,8 +30,9 @@ radv_xclipse_mesh_diag_level(void)
    return (int)debug_get_option_xclipse_mesh_diag();
 }
 
-/* Per-draw summaries are sampled so a frame cannot turn logging into the
- * bottleneck: the first 256, then every 1024th.  Warnings are never sampled. */
+/* Per-draw summaries are sampled per recording thread so a frame cannot turn
+ * logging into the bottleneck: the first 256, then every 1024th.  Some warning
+ * classes are also rate-limited; the log documents those limits. */
 static inline bool
 radv_xclipse_mesh_diag_sample(unsigned *counter)
 {

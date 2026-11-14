@@ -29,7 +29,6 @@ finish() {
 trap finish EXIT
 CODE_SHA=$(git -C "$SOURCE" rev-parse HEAD)
 export CODE_SHA
-[[ "$VARIANT" != baseline || "$CODE_SHA" == fe9b8943aaeec11ed9fccbfcc382da07379afbe5 ]]
 git -C "$SOURCE" diff --exit-code HEAD --
 {
   echo "code_commit=$CODE_SHA"

@@ -15459,14 +15459,21 @@ radv_xclipse_diag_pipeline(struct radv_cmd_buffer *cmd_buffer)
    if (radv_xclipse_mesh_diag_level() <= 0)
       return;
 
+   static _Thread_local const struct radv_shader *last_task, *last_mesh;
+   static _Thread_local unsigned pipeline_logs;
    const struct radv_shader *task = cmd_buffer->state.shaders[MESA_SHADER_TASK];
    const struct radv_shader *mesh = cmd_buffer->state.shaders[MESA_SHADER_MESH];
-   static const struct radv_shader *last_task, *last_mesh;
 
    if (task == last_task && mesh == last_mesh)
       return;
    last_task = task;
    last_mesh = mesh;
+
+   if (pipeline_logs++ >= 32) {
+      if (pipeline_logs == 33)
+         fprintf(stderr, "[X940-19] PIPE further pipeline changes suppressed\n");
+      return;
+   }
 
    if (task) {
       fprintf(stderr,
@@ -15484,12 +15491,11 @@ radv_xclipse_diag_pipeline(struct radv_cmd_buffer *cmd_buffer)
 
    if (mesh) {
       fprintf(stderr,
-              "[X940-19] PIPE mesh=%p wg=%u,%u,%u wave=%u has_task=%u outprim=%u scratch=%u drawid_sgpr=%u "
-              "ring_sgpr=%u\n",
+              "[X940-19] PIPE mesh=%p wg=%u,%u,%u wave=%u has_task=%u outprim=%u scratch=%u ring_sgpr=%u\n",
               (const void *)mesh, mesh->info.cs.block_size[0], mesh->info.cs.block_size[1],
               mesh->info.cs.block_size[2], (unsigned)mesh->info.wave_size, (unsigned)mesh->info.ms.has_task,
               (unsigned)mesh->info.ms.output_prim, (unsigned)mesh->info.ms.needs_ms_scratch_ring,
-              radv_get_user_sgpr_loc(mesh, AC_UD_CS_TASK_DRAW_ID), radv_get_user_sgpr_loc(mesh, AC_UD_TASK_RING_ENTRY));
+              radv_get_user_sgpr_loc(mesh, AC_UD_TASK_RING_ENTRY));
    } else {
       fprintf(stderr, "[X940-19] PIPE mesh=NULL\n");
    }
@@ -15519,20 +15525,21 @@ radv_xclipse_emit_mesh_draw_indirect(struct radv_cmd_buffer *cmd_buffer, uint64_
 
    radv_xclipse_diag_pipeline(cmd_buffer);
 
-   if (!draw_count)
+   static _Thread_local unsigned warned_zero, warned_data;
+   if (!draw_count && warned_zero++ < 8)
       RADV_XCLIPSE_MESH_DIAG_WARN("mesh indirect draw has draw_count=0 (data=0x%llx count_va=0x%llx)\n",
                                   (unsigned long long)data_va, (unsigned long long)count_va);
-   if (!data_va)
+   if (!data_va && warned_data++ < 8)
       RADV_XCLIPSE_MESH_DIAG_WARN("mesh indirect draw has data_va=0 (count=%u count_va=0x%llx)\n", draw_count,
                                   (unsigned long long)count_va);
 
-   static unsigned mesh_indirect_n;
+   static _Thread_local unsigned mesh_indirect_n;
    if (radv_xclipse_mesh_diag_level() > 0 && radv_xclipse_mesh_diag_sample(&mesh_indirect_n))
       RADV_XCLIPSE_MESH_DIAG(2,
-                             "MESH indirect data=0x%llx count=%u count_va=0x%llx draw_index_reg=%u view_mask=0x%x \n"
-                             "base_reg=%u predicating=%d\n",
+                             "MESH indirect data=0x%llx count=%u count_va=0x%llx draw_index_reg=%u "
+                             "view_mask=0x%x base_reg=%u predicating=%d\n",
                              (unsigned long long)data_va, draw_count, (unsigned long long)count_va, draw_index_reg,
-                             view_mask, base_reg, predicating);
+                             (unsigned)view_mask, base_reg, predicating);
 
    assert(base_reg);
 
@@ -15544,10 +15551,10 @@ radv_xclipse_emit_mesh_draw_indirect(struct radv_cmd_buffer *cmd_buffer, uint64_
    const unsigned num_views = MAX2(1, util_bitcount(view_mask));
    uint32_t views = view_mask;
 
-   static unsigned packet_n;
+   static _Thread_local unsigned packet_n;
    if (radv_xclipse_mesh_diag_level() > 0 && radv_xclipse_mesh_diag_sample(&packet_n))
       RADV_XCLIPSE_MESH_DIAG(2,
-                             "PKT DRAW_INDIRECT_MULTI count=%u count_va=0x%llx stride=16 draw_index_reg=%u \n"
+                             "PKT DRAW_INDIRECT_MULTI count=%u count_va=0x%llx stride=16 draw_index_reg=%u "
                              "vertex_offset_reg=%u views=%u\n",
                              draw_count, (unsigned long long)count_va, draw_index_reg, vertex_offset_reg, num_views);
 
@@ -15588,7 +15595,7 @@ radv_xclipse_convert_draw_mesh_tasks(struct radv_cmd_buffer *cmd_buffer, const s
 
    const uint64_t dst_va = radv_buffer_get_va(cmd_buffer->upload.upload_bo) + offset;
 
-   static unsigned conv_n;
+   static _Thread_local unsigned conv_n;
    if (radv_xclipse_mesh_diag_level() > 0 && radv_xclipse_mesh_diag_sample(&conv_n))
       RADV_XCLIPSE_MESH_DIAG(2, "CONV task=%d src=0x%llx stride=%u count_va=0x%llx max=%u dst=0x%llx\n", task,
                              (unsigned long long)info->indirect_va, info->stride,
@@ -15637,12 +15644,12 @@ radv_xclipse_emit_task_state(struct radv_cmd_buffer *cmd_buffer)
    radv_xclipse_diag_pipeline(cmd_buffer);
 
    const uint32_t ring_offsets_loc = radv_get_user_sgpr_loc(task_shader, AC_UD_CS_TASK_RING_OFFSETS);
-   {
-      static bool logged;
+   if (radv_xclipse_mesh_diag_level() > 0) {
+      static _Thread_local bool logged;
       if (!logged) {
          logged = true;
          RADV_XCLIPSE_MESH_DIAG(1,
-                                "TASK state task=%p rings=0x%llx draw_off=%u payload_off=%u entries=%u \n"
+                                "TASK state task=%p rings=0x%llx draw_off=%u payload_off=%u entries=%u "
                                 "ring_offsets_sgpr=%u grid_sgpr=%u drawid_sgpr=%u ring_entry_sgpr=%u\n",
                                 (const void *)task_shader, (unsigned long long)rings_va,
                                 pdev->task_info.draw_ring_offset, pdev->task_info.payload_ring_offset,
@@ -15683,28 +15690,35 @@ radv_xclipse_emit_task_dispatch_draw(struct radv_cmd_buffer *cmd_buffer, const u
    const uint64_t product = (uint64_t)grid[0] * grid[1] * grid[2];
    const uint32_t mesh_draw_count = indirect_va ? max_entries : n;
 
-   static unsigned pass_n;
-   if (radv_xclipse_mesh_diag_level() > 0 && radv_xclipse_mesh_diag_sample(&pass_n))
-      RADV_XCLIPSE_MESH_DIAG(2,
-                             "TASK pass first=%u n=%u grid=%u,%u,%u product=%llu indirect=0x%llx draw_id=%u \n"
-                             "ring_entry=0-%u count_va=0x%llx mesh_draw_count=%u max=%u grid_sgpr=%u "
-                             "ring_entry_sgpr=%u\n",
-                             first, n, grid[0], grid[1], grid[2], (unsigned long long)product,
-                             (unsigned long long)indirect_va, draw_id, first + n, (unsigned long long)count_va,
-                             mesh_draw_count, max_entries, grid_loc, ring_entry_loc);
+   static _Thread_local unsigned pass_n;
+   if (radv_xclipse_mesh_diag_level() > 0 && radv_xclipse_mesh_diag_sample(&pass_n)) {
+      if (indirect_va) {
+         RADV_XCLIPSE_MESH_DIAG(2,
+                                "TASK pass indirect first=%u n=%u ring_range=[0,%u) (GPU-defined, max) "
+                                "count_va=0x%llx mesh_draw_count=%u max=%u grid_sgpr=%u ring_entry_sgpr=%u "
+                                "draw_id=%u\n",
+                                first, n, max_entries, (unsigned long long)count_va, mesh_draw_count, max_entries,
+                                grid_loc, ring_entry_loc, draw_id);
+      } else {
+         RADV_XCLIPSE_MESH_DIAG(2,
+                                "TASK pass grid=%u,%u,%u first=%u n=%u ring_range=[0,%u) product=%llu "
+                                "mesh_draw_count=%u max=%u grid_sgpr=%u ring_entry_sgpr=%u draw_id=%u\n",
+                                grid[0], grid[1], grid[2], first, n, n, (unsigned long long)product,
+                                mesh_draw_count, max_entries, grid_loc, ring_entry_loc, draw_id);
+      }
+   }
 
-   static unsigned warned_xy, warned_multidim, warned_empty;
+   static _Thread_local unsigned warned_multidim, warned_empty;
    if (!indirect_va && n == 0 && warned_empty++ < 8)
       RADV_XCLIPSE_MESH_DIAG_WARN("task direct pass draw_id=%u has n=0 (grid=%u,%u,%u)\n", draw_id, grid[0],
                                   grid[1], grid[2]);
-   if ((grid[0] > 0xffff || grid[1] > 0xffff) && warned_xy++ < 8)
-      RADV_XCLIPSE_MESH_DIAG_WARN("grid %u,%u,%u does not fit the packed x|y<<16 user SGPR (x/y > 65535)\n",
-                                  grid[0], grid[1], grid[2]);
    if (!indirect_va && (grid[1] > 1 || grid[2] > 1) && product > max_entries && warned_multidim++ < 8)
       RADV_XCLIPSE_MESH_DIAG_WARN(
-         "multidimensional grid %u,%u,%u product=%llu exceeds ring entries=%u; task workgroups past the ring write "
-         "past the draw ring (rasterization will be corrupt)\n",
-         grid[0], grid[1], grid[2], (unsigned long long)product, max_entries);
+         "task direct multidimensional grid %u,%u,%u product=%llu exceeds usable ring records=%u; "
+         "task_ring_entry_index masks with num_entries-1, so excess workgroups hit the reserved count entry "
+         "or wrap and overwrite earlier draw/payload records; only the first %u records are consumed "
+         "(rasterization will be corrupt)\n",
+         grid[0], grid[1], grid[2], (unsigned long long)product, max_entries, max_entries);
 
    /* Mesh shaders of an earlier draw may still read the payload ring. */
    cmd_buffer->state.flush_bits |= AC_BARRIER_SYNC_VS | AC_BARRIER_SYNC_PS;
@@ -15793,24 +15807,27 @@ radv_xclipse_emit_task_draw(struct radv_cmd_buffer *cmd_buffer, const struct rad
    const uint32_t max_entries = pdev->task_info.num_entries - 1;
    const uint32_t grid[3] = {x, y, z};
    const uint64_t product = (uint64_t)x * y * z;
-   static unsigned warned_product, warned_pack, warned_multidim;
+   static _Thread_local unsigned warned_product, warned_multidim;
 
-   static unsigned task_draw_n;
-   if (radv_xclipse_mesh_diag_level() > 0 && radv_xclipse_mesh_diag_sample(&task_draw_n))
-      RADV_XCLIPSE_MESH_DIAG(1, "TASK draw x=%u y=%u z=%u product=%llu count=%u indirect=0x%llx max_entries=%u\n", x,
-                             y, z, (unsigned long long)product, info->count,
-                             (unsigned long long)info->indirect_va, max_entries);
+   static _Thread_local unsigned task_draw_n;
+   if (radv_xclipse_mesh_diag_level() > 0 && radv_xclipse_mesh_diag_sample(&task_draw_n)) {
+      if (info->indirect_va)
+         RADV_XCLIPSE_MESH_DIAG(1, "TASK indirect count=%u stride=%u max_entries=%u\n", info->count, info->stride,
+                                max_entries);
+      else
+         RADV_XCLIPSE_MESH_DIAG(1, "TASK draw x=%u y=%u z=%u product=%llu count=%u max_entries=%u\n", x, y, z,
+                                (unsigned long long)product, info->count, max_entries);
+   }
 
-   if (product > UINT32_MAX && warned_product++ < 8)
+   if (!info->indirect_va && product > UINT32_MAX && warned_product++ < 8)
       RADV_XCLIPSE_MESH_DIAG_WARN("task grid %u,%u,%u product=%llu overflows the 32-bit draw count (%u)\n", x, y, z,
                                   (unsigned long long)product, info->count);
    if (!info->indirect_va && (y > 1 || z > 1) && product > max_entries && warned_multidim++ < 8)
       RADV_XCLIPSE_MESH_DIAG_WARN(
-         "task direct grid %u,%u,%u product=%llu exceeds ring entries=%u; only the first %u workgroups have ring "
-         "slots and later workgroups write past the ring (rasterization will be corrupt)\n",
+         "task direct grid %u,%u,%u product=%llu exceeds usable ring records=%u; task_ring_entry_index masks "
+         "with num_entries-1, so excess workgroups hit the reserved count entry or wrap and overwrite earlier "
+         "draw/payload records; only the first %u records are consumed (rasterization will be corrupt)\n",
          x, y, z, (unsigned long long)product, max_entries, max_entries);
-   if ((x > 0xffff || y > 0xffff) && warned_pack++ < 8)
-      RADV_XCLIPSE_MESH_DIAG_WARN("task grid %u,%u,%u does not fit the packed x|y<<16 user SGPR\n", x, y, z);
 
    radv_xclipse_emit_task_state(cmd_buffer);
 
@@ -15832,8 +15849,8 @@ radv_xclipse_emit_task_draw(struct radv_cmd_buffer *cmd_buffer, const struct rad
    cmd_buffer->state.dirty |= RADV_CMD_DIRTY_COMPUTE_PIPELINE | RADV_CMD_DIRTY_RAY_TRACING_PIPELINE;
 }
 
-#define RADV_XCLIPSE_MAX_TASK_DRAWS 64
-#define RADV_XCLIPSE_MAX_MESH_DRAWS 16384
+#define RADV_XCLIPSE_MAX_TASK_DRAWS 64u
+#define RADV_XCLIPSE_MAX_MESH_DRAWS 16384u
 
 static void
 radv_xclipse_draw_mesh_tasks_indirect(struct radv_cmd_buffer *cmd_buffer, struct radv_draw_info *info)
@@ -15841,7 +15858,7 @@ radv_xclipse_draw_mesh_tasks_indirect(struct radv_cmd_buffer *cmd_buffer, struct
    const bool has_task = radv_cmdbuf_has_stage(cmd_buffer, MESA_SHADER_TASK);
    const uint32_t app_count = info->count;
 
-   static unsigned indirect_draw_n;
+   static _Thread_local unsigned indirect_draw_n;
    if (radv_xclipse_mesh_diag_level() > 0 && radv_xclipse_mesh_diag_sample(&indirect_draw_n))
       RADV_XCLIPSE_MESH_DIAG(1,
                              "DRAW indirect app_count=%u stride=%u count_va=0x%llx has_task=%d task_cap=%u "
@@ -15854,10 +15871,12 @@ radv_xclipse_draw_mesh_tasks_indirect(struct radv_cmd_buffer *cmd_buffer, struct
 
    if (has_task) {
       info->count = MIN2(info->count, RADV_XCLIPSE_MAX_TASK_DRAWS);
-      if (app_count > RADV_XCLIPSE_MAX_TASK_DRAWS)
+      static _Thread_local unsigned warned_task_cap;
+      if (app_count > RADV_XCLIPSE_MAX_TASK_DRAWS && warned_task_cap++ < 8)
          RADV_XCLIPSE_MESH_DIAG_WARN(
-            "task indirect drawCount=%u exceeds the emulation cap=%u; only %u task draws run\n", app_count,
-            RADV_XCLIPSE_MAX_TASK_DRAWS, RADV_XCLIPSE_MAX_TASK_DRAWS);
+            "task indirect drawCount=%u is the declared maximum and exceeds the emulation cap=%u; at most %u "
+            "task draws are processed (the actual GPU count may be lower)\n",
+            app_count, RADV_XCLIPSE_MAX_TASK_DRAWS, RADV_XCLIPSE_MAX_TASK_DRAWS);
 
       if (info->count_va) {
          /* Entries past the count become empty dispatches. */
@@ -15867,15 +15886,17 @@ radv_xclipse_draw_mesh_tasks_indirect(struct radv_cmd_buffer *cmd_buffer, struct
       }
    } else {
       info->count = MIN2(info->count, RADV_XCLIPSE_MAX_MESH_DRAWS);
-      if (app_count > RADV_XCLIPSE_MAX_MESH_DRAWS)
+      static _Thread_local unsigned warned_mesh_cap;
+      if (app_count > RADV_XCLIPSE_MAX_MESH_DRAWS && warned_mesh_cap++ < 8)
          RADV_XCLIPSE_MESH_DIAG_WARN(
-            "mesh indirect drawCount=%u exceeds the emulation cap=%u; only %u mesh draws run\n", app_count,
-            RADV_XCLIPSE_MAX_MESH_DRAWS, RADV_XCLIPSE_MAX_MESH_DRAWS);
+            "mesh indirect drawCount=%u is the declared maximum and exceeds the emulation cap=%u; at most %u "
+            "mesh draws are processed (the actual GPU count may be lower)\n",
+            app_count, RADV_XCLIPSE_MAX_MESH_DRAWS, RADV_XCLIPSE_MAX_MESH_DRAWS);
       info->indirect_va = radv_xclipse_convert_draw_mesh_tasks(cmd_buffer, info, info->count, false);
       info->stride = 16;
    }
 
-   static unsigned indirect_clamped_n;
+   static _Thread_local unsigned indirect_clamped_n;
    if (radv_xclipse_mesh_diag_level() > 0 && radv_xclipse_mesh_diag_sample(&indirect_clamped_n))
       RADV_XCLIPSE_MESH_DIAG(1, "DRAW indirect clamped=%u converted=0x%llx stride=%u count_va=0x%llx\n", info->count,
                              (unsigned long long)info->indirect_va, info->stride,
@@ -15925,17 +15946,27 @@ radv_CmdDrawMeshTasksEXT(VkCommandBuffer commandBuffer, uint32_t x, uint32_t y, 
    userdata.y = y;
    userdata.z = z;
 
+   const uint64_t product = (uint64_t)x * y * z;
+
+   if (!radv_before_taskmesh_draw(cmd_buffer, &info, &userdata, false))
+      return;
+
+   /* radv_before_taskmesh_draw() binds deferred graphics shaders.  Read the
+    * stage mask only after it, otherwise a shader bound with CmdBindShadersEXT
+    * for this draw is missed and a stale task shader bit can select the wrong
+    * packet path. */
    const bool has_task = radv_cmdbuf_has_stage(cmd_buffer, MESA_SHADER_TASK);
    const bool emul = radv_device_physical(device)->xclipse_taskmesh_emul;
-   const uint64_t product = (uint64_t)x * y * z;
    const char *path = emul && has_task ? "task-emul" : has_task ? "task-native" : "mesh-native-direct";
 
-   static unsigned direct_draw_n;
+   radv_xclipse_diag_pipeline(cmd_buffer);
+
+   static _Thread_local unsigned direct_draw_n;
    if (radv_xclipse_mesh_diag_level() > 0 && radv_xclipse_mesh_diag_sample(&direct_draw_n))
       RADV_XCLIPSE_MESH_DIAG(1, "DRAW direct path=%s x=%u y=%u z=%u product=%llu count=%u has_task=%d emul=%d\n",
                              path, x, y, z, (unsigned long long)product, info.count, has_task, emul);
-   if (!has_task && emul) {
-      static bool logged_mesh_native;
+   if (!has_task && emul && radv_xclipse_mesh_diag_level() > 0) {
+      static _Thread_local bool logged_mesh_native;
       if (!logged_mesh_native) {
          logged_mesh_native = true;
          RADV_XCLIPSE_MESH_DIAG(1, "MESH direct path uses the native DISPATCH_MESH_DIRECT packet (not emulated)\n");
@@ -15943,15 +15974,13 @@ radv_CmdDrawMeshTasksEXT(VkCommandBuffer commandBuffer, uint32_t x, uint32_t y, 
    }
    const uint32_t ring_entries = radv_device_physical(device)->task_info.num_entries;
    if (has_task && emul && (y > 1 || z > 1) && product > (uint64_t)(ring_entries - 1)) {
-      static unsigned warned;
+      static _Thread_local unsigned warned;
       if (warned++ < 8)
          RADV_XCLIPSE_MESH_DIAG_WARN(
-            "task direct grid %u,%u,%u product=%llu exceeds ring entries=%u (emulation cannot represent it)\n", x,
-            y, z, (unsigned long long)product, ring_entries - 1);
+            "task direct grid %u,%u,%u product=%llu exceeds usable ring records=%u "
+            "(emulation cannot represent it)\n",
+            x, y, z, (unsigned long long)product, ring_entries - 1);
    }
-
-   if (!radv_before_taskmesh_draw(cmd_buffer, &info, &userdata, false))
-      return;
 
    if (emul && has_task) {
       radv_xclipse_emit_task_draw(cmd_buffer, &info, x, y, z);

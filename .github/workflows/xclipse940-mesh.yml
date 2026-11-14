@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       variant:
-        description: 'baseline builds pristine fe9b894; diag19 builds this branch on v1.9.0 with diagnostics'
+        description: 'diag19 builds this branch on v1.9.0 with opt-in diagnostics'
         type: choice
-        options: [baseline, diag19]
+        options: [diag19]
         default: diag19
 
 permissions:
@@ -33,19 +33,10 @@ jobs:
         with:
           path: control
           persist-credentials: false
-      - name: Select driver revision
-        id: source
-        shell: bash
-        run: |
-          if [[ "$VARIANT" == baseline ]]; then
-            echo 'ref=fe9b8943aaeec11ed9fccbfcc382da07379afbe5' >> "$GITHUB_OUTPUT"
-          else
-            echo "ref=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
-          fi
-      - name: Check out driver (baseline has no source patches)
+      - name: Check out driver (this branch)
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ steps.source.outputs.ref }}
+          ref: ${{ github.sha }}
           path: driver
           fetch-depth: 0
           persist-credentials: false
