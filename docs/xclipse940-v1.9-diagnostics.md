@@ -17,8 +17,8 @@ summaries, and rate-limited warnings. Level 2 also prints **sampled** ring
 passes, indirect conversions, and the `DRAW_INDIRECT_MULTI` arguments.
 
 Sampling is per recording thread: the first 256 records, then every 1024th
-record. Pipeline changes are logged for at most 32 distinct task/mesh shader
-pairs (a further-change note follows). Several warning classes log at most eight
+record. Pipeline changes are logged for the first 32 task/mesh pair changes per
+recording thread, including repeats (a further-change note follows). Several warning classes log at most eight
 occurrences; a few one-shot warnings log once. A clean log is therefore not a
 complete trace.
 

@@ -603,7 +603,7 @@ radv_xclipse_convert_mesh_tasks(struct radv_cmd_buffer *cmd_buffer, uint64_t src
                              (unsigned long long)src_va, stride, (unsigned long long)count_va, max_count,
                              (unsigned long long)dst_va);
    static _Thread_local bool warned_zero;
-   if (!max_count && !warned_zero) {
+   if (radv_xclipse_mesh_diag_level() > 0 && !max_count && !warned_zero) {
       warned_zero = true;
       RADV_XCLIPSE_MESH_DIAG_WARN("mesh task conversion dispatched with max_count=0\n");
    }
