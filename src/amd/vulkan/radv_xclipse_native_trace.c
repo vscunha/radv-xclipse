@@ -56,7 +56,8 @@ struct radv_xclipse_native_trace {
    int submit_result;
 
    uint64_t last_present_ns;
-   unsigned slow_presents;
+   unsigned slow_run;
+   unsigned slow_reported;
 };
 
 static struct radv_xclipse_native_trace trace;
@@ -248,15 +249,25 @@ radv_xclipse_native_trace_present(struct radv_device *device)
    const uint64_t frame_ns = trace.last_present_ns ? now - trace.last_present_ns : 0;
    trace.last_present_ns = now;
 
-   /* A normal 30 FPS frame is ~33 ms; report only the first eight frames that
-    * took at least 100 ms. The trace state is the last task pass/conversion/
-    * submit of that frame, which is what the next readback needs. */
-   if (frame_ns < 100000000ull || trace.slow_presents >= 8) {
+   /* A normal 30 FPS frame is ~33 ms. Report only a run of slow frames: the
+    * first eight frames of one run. Isolated slow frames (shader compilation
+    * or scene loading at startup) are ignored, and a fast frame starts a new
+    * run. The trace state is the last task pass/conversion/submit of the frame
+    * being reported, which is what the readback needs. */
+   if (frame_ns < 100000000ull) {
+      trace.slow_run = 0;
+      trace.slow_reported = 0;
       simple_mtx_unlock(&trace_lock);
       return;
    }
 
-   slow = trace.slow_presents++;
+   trace.slow_run++;
+   if (trace.slow_run < 2 || trace.slow_reported >= 8) {
+      simple_mtx_unlock(&trace_lock);
+      return;
+   }
+
+   slow = trace.slow_reported++;
    snapshot = trace;
    have_task = trace.have_task;
    have_convert = trace.have_convert;
