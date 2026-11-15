@@ -15671,6 +15671,25 @@ radv_xclipse_emit_task_state(struct radv_cmd_buffer *cmd_buffer)
    }
 }
 
+/* RADV_XCLIPSE_MESHBISECT (diagnostic, read per draw so a live control file can change it
+ * mid-scene): splits one emulated task/mesh draw into its two halves, to find which half costs the
+ * frame. bit 1 (1) = do not emit the task shader's dispatch; bit 2 (2) = do not emit the mesh draw;
+ * 3 = neither (the pair becomes a no-op plus its barrier). Rendering is wrong by design in every
+ * mode but 0: the draw ring and the payload are not what the shaders wrote. */
+static int
+xclipse_mesh_bisect(void)
+{
+   const char *e = getenv("RADV_XCLIPSE_MESHBISECT");
+   const int v = e && *e ? atoi(e) : 0;
+   static int last = -1;
+   if (v != last) {
+      last = v;
+      fprintf(stderr, "radv: xclipse: mesh bisect %d: task dispatch %s, mesh draw %s\n", v,
+              v & 1 ? "off" : "on", v & 2 ? "off" : "on");
+   }
+   return v;
+}
+
 /* One task dispatch followed by the mesh draws it produced. indirect_va != 0 reads the grid from
  * memory. Ring entries [0, n) are used, counted from the workgroup 'first' along x. */
 static void
@@ -15738,7 +15757,9 @@ radv_xclipse_emit_task_dispatch_draw(struct radv_cmd_buffer *cmd_buffer, const u
       radeon_end();
    }
 
-   if (indirect_va) {
+   const int bisect = xclipse_mesh_bisect();
+
+   if (!(bisect & 1) && indirect_va) {
       /* No task workgroup runs for an empty grid, so the count has to start at zero. */
       ac_emit_cp_copy_data(cs->b, COPY_DATA_IMM, COPY_DATA_DST_MEM, 0, count_va, AC_CP_COPY_DATA_WR_CONFIRM, false);
 
@@ -15758,7 +15779,7 @@ radv_xclipse_emit_task_dispatch_draw(struct radv_cmd_buffer *cmd_buffer, const u
       radeon_emit(0);
       radeon_emit(initiator | S_00B800_FORCE_START_AT_000(1));
       radeon_end();
-   } else {
+   } else if (!(bisect & 1)) {
       radeon_begin(cs);
       if (grid_loc) {
          radeon_set_sh_reg_seq(grid_loc, 3);
@@ -15801,9 +15822,10 @@ radv_xclipse_emit_task_dispatch_draw(struct radv_cmd_buffer *cmd_buffer, const u
 
    radv_xclipse_native_trace_record_task(cmd_buffer, grid, first, n, indirect_va != 0, count_va, draw_ring_va,
                                          mesh_draw_count, draw_id, task_shader, mesh_shader);
-   radv_xclipse_emit_mesh_draw_indirect(cmd_buffer, draw_ring_va, indirect_va ? max_entries : n,
-                                        indirect_va ? count_va : 0,
-                                        radv_get_user_sgpr(mesh_shader, AC_UD_TASK_RING_ENTRY));
+   if (!(bisect & 2))
+      radv_xclipse_emit_mesh_draw_indirect(cmd_buffer, draw_ring_va, indirect_va ? max_entries : n,
+                                           indirect_va ? count_va : 0,
+                                           radv_get_user_sgpr(mesh_shader, AC_UD_TASK_RING_ENTRY));
 }
 
 static void
