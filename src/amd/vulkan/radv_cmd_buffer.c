@@ -15710,6 +15710,39 @@ xclipse_mesh_flush_mask(void)
    return v;
 }
 
+/* RADV_XCLIPSE_MESHTINY (diagnostic, read per draw, live): emit the task dispatch of a direct task
+ * draw as a 1x1x1 grid instead of the real one. Same number of DISPATCH packets, one workgroup of
+ * task shader instead of the real grid, mesh draw unchanged. Separates a fixed per-dispatch cost from
+ * the cost of the work the task shader does. Rendering is wrong by design. */
+static int
+xclipse_mesh_tiny(void)
+{
+   const char *e = getenv("RADV_XCLIPSE_MESHTINY");
+   const int v = e && *e ? atoi(e) : 0;
+   static int last = -1;
+   if (v != last) {
+      last = v;
+      fprintf(stderr, "radv: xclipse: mesh tiny %d: every task dispatch is a 1x1x1 grid\n", v);
+   }
+   return v != 0;
+}
+
+/* RADV_XCLIPSE_MESHSKIP (diagnostic, read per draw, live): emit only one task draw in n, skip both
+ * halves of the others, to see whether the frame time scales with how many task draws run at all.
+ * 0 and 1 mean every draw. Rendering is wrong by design. */
+static int
+xclipse_mesh_skip(void)
+{
+   const char *e = getenv("RADV_XCLIPSE_MESHSKIP");
+   const int v = e && *e ? atoi(e) : 0;
+   static int last = -1;
+   if (v != last) {
+      last = v;
+      fprintf(stderr, "radv: xclipse: mesh skip %d: one task draw in %d is emitted\n", v, v > 1 ? v : 1);
+   }
+   return v;
+}
+
 /* One task dispatch followed by the mesh draws it produced. indirect_va != 0 reads the grid from
  * memory. Ring entries [0, n) are used, counted from the workgroup 'first' along x. */
 static void
@@ -15764,6 +15797,14 @@ radv_xclipse_emit_task_dispatch_draw(struct radv_cmd_buffer *cmd_buffer, const u
 
    const int bisect = xclipse_mesh_bisect();
    const int flush_mask = xclipse_mesh_flush_mask();
+   const int tiny = xclipse_mesh_tiny();
+
+   {
+      const int skip = xclipse_mesh_skip();
+      static _Thread_local unsigned skip_n;
+      if (skip > 1 && (skip_n++ % skip) != 0)
+         return;
+   }
 
    /* Mesh shaders of an earlier draw may still read the payload ring. */
    if (!(flush_mask & 1)) {
@@ -15776,13 +15817,13 @@ radv_xclipse_emit_task_dispatch_draw(struct radv_cmd_buffer *cmd_buffer, const u
    {
       radeon_begin(cs);
       if (ring_entry_loc)
-         radeon_set_sh_reg(ring_entry_loc, 0u - first);
+         radeon_set_sh_reg(ring_entry_loc, tiny ? 0u : 0u - first);
       if (draw_id_loc)
          radeon_set_sh_reg(draw_id_loc, draw_id);
       radeon_end();
    }
 
-   if (!(bisect & 1) && indirect_va) {
+   if (!(bisect & 1) && indirect_va && !tiny) {
       /* No task workgroup runs for an empty grid, so the count has to start at zero. */
       ac_emit_cp_copy_data(cs->b, COPY_DATA_IMM, COPY_DATA_DST_MEM, 0, count_va, AC_CP_COPY_DATA_WR_CONFIRM, false);
 
@@ -15803,17 +15844,20 @@ radv_xclipse_emit_task_dispatch_draw(struct radv_cmd_buffer *cmd_buffer, const u
       radeon_emit(initiator | S_00B800_FORCE_START_AT_000(1));
       radeon_end();
    } else if (!(bisect & 1)) {
+      const uint32_t g0 = tiny ? 1 : grid[0], g1 = tiny ? 1 : grid[1], g2 = tiny ? 1 : grid[2];
+      const uint32_t start = tiny ? 0 : first;
+
       radeon_begin(cs);
       if (grid_loc) {
          radeon_set_sh_reg_seq(grid_loc, 3);
-         radeon_emit(grid[0]);
-         radeon_emit(grid[1]);
-         radeon_emit(grid[2]);
+         radeon_emit(g0);
+         radeon_emit(g1);
+         radeon_emit(g2);
       }
 
-      if (first) {
+      if (start) {
          radeon_set_sh_reg_seq(R_00B810_COMPUTE_START_X, 3);
-         radeon_emit(first);
+         radeon_emit(start);
          radeon_emit(0);
          radeon_emit(0);
       } else {
@@ -15821,9 +15865,9 @@ radv_xclipse_emit_task_dispatch_draw(struct radv_cmd_buffer *cmd_buffer, const u
       }
 
       radeon_emit(PKT3(PKT3_DISPATCH_DIRECT, 3, 0) | PKT3_SHADER_TYPE_S(1));
-      radeon_emit(grid[1] == 1 && grid[2] == 1 ? first + n : grid[0]);
-      radeon_emit(grid[1]);
-      radeon_emit(grid[2]);
+      radeon_emit(tiny ? 1 : g1 == 1 && g2 == 1 ? start + n : g0);
+      radeon_emit(g1);
+      radeon_emit(g2);
       radeon_emit(initiator);
       radeon_end();
    }
