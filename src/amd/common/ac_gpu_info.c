@@ -313,6 +313,29 @@ ac_xclipse_legacy_sync(const struct radeon_info *info)
    return info->xclipse_model != AC_XCLIPSE_NONE && knob != 0;
 }
 
+/* RADV_XCLIPSE_TASKBAR / debug.radv_xclipse_taskbar: the barrier between a task shader's dispatch (which
+ * writes the draw ring and the payload) and the mesh draw that consumes them. The upstream bits are
+ * SYNC_CS | INV_VMEM | INV_SMEM | INV_L2 | WB_L2 | PFP_SYNC_ME, and on this firmware that is a
+ * CS_PARTIAL_FLUSH plus a GCR writeback and invalidate of the whole L2 plus an ACQUIRE_MEM at the PFP,
+ * per task draw. 1 = drop INV_L2 | WB_L2 | PFP_SYNC_ME and keep SYNC_CS | INV_VMEM | INV_SMEM: L2 is
+ * the coherence point between the compute and the graphics client, so a producer and a consumer that
+ * both run on the GPU need the L1 invalidates and the CS idle, not a writeback of the L2 to memory
+ * (that one is for reads and writes the CPU made). Off by default: an experiment, for A/B runs.
+ */
+bool
+ac_xclipse_light_task_barrier(const struct radeon_info *info)
+{
+   static int knob = -2;
+   if (knob == -2) {
+      const char *src;
+      knob = xclipse_knob_int("RADV_XCLIPSE_TASKBAR", "debug.radv_xclipse_taskbar", &src);
+      if (knob > 0)
+         fprintf(stderr, "radv: xclipse: the task/mesh barrier between the dispatch and the draw is the light "
+                         "one (no L2 writeback, no PFP sync) [%s=%d]\n", src, knob);
+   }
+   return info->xclipse_model != AC_XCLIPSE_NONE && knob != 0;
+}
+
 /* RADV_XCLIPSE_SPI11 / debug.radv_xclipse_spi11: program the SPI wave launch registers as the
  * vendor does. A bit mask, default 3, 0 = the values used before.
  *

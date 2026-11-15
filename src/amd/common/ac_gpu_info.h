@@ -595,6 +595,7 @@ const struct ac_xclipse_pbb *ac_xclipse_pbb(const struct radeon_info *info);
 bool ac_xclipse_full_db_flush(const struct radeon_info *info);
 bool ac_xclipse_mesh_shaders(const struct radeon_info *info);
 bool ac_xclipse_legacy_sync(const struct radeon_info *info);
+bool ac_xclipse_light_task_barrier(const struct radeon_info *info);
 #define AC_XCLIPSE_SPI11_GS_RSRC4     0x1
 #define AC_XCLIPSE_SPI11_PS_LDS_GROUP 0x2
 unsigned ac_xclipse_spi11(const struct radeon_info *info);

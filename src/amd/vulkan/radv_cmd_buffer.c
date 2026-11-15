@@ -15784,9 +15784,12 @@ radv_xclipse_emit_task_dispatch_draw(struct radv_cmd_buffer *cmd_buffer, const u
       radeon_end();
    }
 
-   /* The CP reads the draw ring and the mesh shaders read the payload. */
-   cmd_buffer->state.flush_bits |= AC_BARRIER_SYNC_CS | AC_BARRIER_INV_VMEM | AC_BARRIER_INV_SMEM |
-                                   AC_BARRIER_INV_L2 | AC_BARRIER_WB_L2 | AC_BARRIER_PFP_SYNC_ME;
+   /* The CP reads the draw ring and the mesh shaders read the payload. Radv asks for INV_L2 | WB_L2 here
+    * too; RADV_XCLIPSE_TASKBAR=1 leaves them out (ac_gpu_info.c "light task barrier").
+    */
+   cmd_buffer->state.flush_bits |= AC_BARRIER_SYNC_CS | AC_BARRIER_INV_VMEM | AC_BARRIER_INV_SMEM;
+   if (!ac_xclipse_light_task_barrier(&radv_device_physical(device)->info))
+      cmd_buffer->state.flush_bits |= AC_BARRIER_INV_L2 | AC_BARRIER_WB_L2 | AC_BARRIER_PFP_SYNC_ME;
    radv_emit_cache_flush(cmd_buffer, false);
 
    if (cmd_buffer->state.uses_drawid) {
