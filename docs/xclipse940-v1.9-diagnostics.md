@@ -107,19 +107,26 @@ frame it dumps:
   the GPU-written count, draw-ring offset, the first 8 draw records (32 words),
   and the first 8 payload words. For a direct task draw there is no
   GPU-written count entry; the CPU workgroup count (`n`) is reported instead.
-- `TRACE convert ...` / `TRACE convert record[i] ...` — the last indirect
-  conversion: source/destination, stride, max count, and up to four converted
-  16-byte records.
+- `TRACE convert ...` — the last indirect conversion: source/destination,
+  stride, and max count. The converted records themselves are not read back:
+  the conversion writes into the command buffer's upload BO, whose CPU mapping
+  the command buffer owns and writes through (`cmd_buffer->upload.map`).
+  `buffer_map` hands back that same mapping, so `buffer_unmap` would munmap it
+  and leave the command buffer writing into an unmapped range on the next
+  frame — a SIGSEGV at a page boundary (this is what the first level-3 build
+  did at the first slow frame). The record contents are therefore left to the
+  `CONV` line at record time.
 - `TRACE submit ...` — the last submit's IP type, ring, IB count, BO-list count,
   sequence number, user-fence flag, and ioctl result.
 - `TRACE fence wait_ms=...` — a `vkWaitForFences` call that blocked for at least
   100 ms.
 
 The readback is not a full BO dump. It is limited to the first eight frames of
-a slow run, the first eight draw/payload records, and four converted records; a
-normal 30 FPS run produces no `TRACE` lines. The values are read after the
-frame boundary, so they describe the last task pass/conversion/submit of that
-frame, not an arbitrary earlier draw.
+a slow run and the first eight draw/payload records; a normal 30 FPS run
+produces no `TRACE` lines. Only the device-wide task ring BO is mapped (and
+unmapped again) for the readback; no other buffer's mapping is touched. The
+values are read after the frame boundary, so they describe the last task
+pass/conversion/submit of that frame, not an arbitrary earlier draw.
 
 ## What this cannot tell you
 

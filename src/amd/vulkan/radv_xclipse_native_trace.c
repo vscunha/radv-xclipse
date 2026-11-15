@@ -159,6 +159,11 @@ trace_task_ring(struct radv_device *device, const struct radv_xclipse_native_tra
       return;
    }
 
+   /* The task ring BO belongs to the device and nothing keeps its CPU mapping between calls
+    * (radv_xclipse_task_bo and radv_initialise_task_control_buffer both map and unmap it), so
+    * mapping it here and unmapping it at the end hands back no one else's mapping. Unlike the
+    * command buffer's upload BO below: that one stays mapped. */
+
    uint32_t count = 0;
    uint32_t count_off = 0;
    if (snapshot->task_count_va) {
@@ -203,35 +208,27 @@ trace_task_ring(struct radv_device *device, const struct radv_xclipse_native_tra
 }
 
 static void
-trace_converted_record(struct radv_device *device, const struct radv_xclipse_native_trace *snapshot)
+trace_converted_record(const struct radv_xclipse_native_trace *snapshot)
 {
-   struct radeon_winsys_bo *bo = snapshot->convert_upload_bo;
-
-   if (!bo) {
+   if (!snapshot->convert_upload_bo) {
       RADV_XCLIPSE_MESH_DIAG(3, "TRACE convert upload BO absent max=%u stride=%u task=%u\n",
                              snapshot->convert_max_count, snapshot->convert_stride, snapshot->convert_task);
       return;
    }
 
-   const uint32_t *map = radv_buffer_map(device->ws, bo);
-   if (!map) {
-      RADV_XCLIPSE_MESH_DIAG(3, "TRACE convert upload map failed\n");
-      return;
-   }
-
-   const uint32_t *r = &map[snapshot->convert_dst_offset / 4];
-   const uint32_t records = snapshot->convert_max_count < 4 ? snapshot->convert_max_count : 4;
+   /* The converted records live in the command buffer's upload BO, whose CPU mapping the command
+    * buffer owns (cmd_buffer->upload.map) and writes through while it records. buffer_map would
+    * hand back that very mapping and buffer_unmap would munmap it, leaving the command buffer to
+    * write into an unmapped range on the next frame (a SIGSEGV at a page boundary, which is what
+    * the level-3 build did at the first slow frame). So the records are not read back here: the
+    * CONV line at record time already carries src/count/dst/stride/max. */
    RADV_XCLIPSE_MESH_DIAG(3,
                           "TRACE convert task=%u src=0x%llx count_va=0x%llx dst=0x%llx off=%u stride=%u max=%u "
-                          "records=%u\n",
+                          "records=%u (not read back: the upload BO's mapping belongs to the command buffer)\n",
                           snapshot->convert_task, (unsigned long long)snapshot->convert_src_va,
                           (unsigned long long)snapshot->convert_count_va, (unsigned long long)snapshot->convert_dst_va,
-                          snapshot->convert_dst_offset, snapshot->convert_stride, snapshot->convert_max_count, records);
-   for (uint32_t i = 0; i < records; i++) {
-      const uint32_t *rec = &r[i * 4];
-      RADV_XCLIPSE_MESH_DIAG(3, "TRACE convert record[%u] %u,%u,%u,%u\n", i, rec[0], rec[1], rec[2], rec[3]);
-   }
-   device->ws->buffer_unmap(device->ws, bo, false);
+                          snapshot->convert_dst_offset, snapshot->convert_stride, snapshot->convert_max_count,
+                          snapshot->convert_max_count < 4 ? snapshot->convert_max_count : 4);
 }
 
 void
@@ -285,7 +282,7 @@ radv_xclipse_native_trace_present(struct radv_device *device)
    if (snapshot.device == device && have_task)
       trace_task_ring(device, &snapshot);
    if (snapshot.device == device && have_convert)
-      trace_converted_record(device, &snapshot);
+      trace_converted_record(&snapshot);
    if (have_submit)
       RADV_XCLIPSE_MESH_DIAG(3, "TRACE submit ip=%u ring=%u ibs=%u handles=%u seq=%llu user_fence=%u result=%d\n",
                              snapshot.submit_ip_type, snapshot.submit_ring, snapshot.submit_ibs,
