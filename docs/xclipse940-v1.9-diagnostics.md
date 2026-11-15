@@ -20,12 +20,15 @@ Level 1 prints device/ring/pipeline information, **sampled** application-draw
 summaries, and rate-limited warnings. Level 2 also prints **sampled** ring
 passes, indirect conversions, and the `DRAW_INDIRECT_MULTI` arguments. Level 3
 also enables the bounded native-path readback described below: the first eight
-Android frames slower than 100 ms dump the last task count/draw-ring/payload
-words, the last conversion record, the last submit metadata, and slow
-`vkWaitForFences` calls.
+Android frames of a run of consecutive slow frames dump the last
+task count/draw-ring/payload words, the last conversion record, the last submit
+metadata, and slow `vkWaitForFences` calls. A single isolated slow frame is
+skipped and a fast frame starts a new run.
 
 Sampling is per recording thread: the first 256 records, then every 1024th
-record. Pipeline changes are logged for the first 32 task/mesh pair changes per
+record. The level-3 task/conversion/submit snapshot is shared across the
+recording, submit and present threads; the last snapshot is copied and cleared
+at the frame boundary. Pipeline changes are logged for the first 32 task/mesh pair changes per
 recording thread, including repeats (a further-change note follows). Several warning classes log at most eight
 occurrences; a few one-shot warnings log once. A clean log is therefore not a
 complete trace.
@@ -96,11 +99,14 @@ not inspected.
 
 Level 3 is a targeted trace for a clean level-1/2 log. At the Android frame
 boundary (`QueueSignalReleaseImageANDROID`) it reports the first eight frames
-that took at least 100 ms. For each such frame it dumps:
+of a run of consecutive frames that took at least 100 ms. A single isolated
+slow frame is skipped, and a fast frame starts a new run. For each reported
+frame it dumps:
 
 - `TRACE task ...` — the last task pass: grid, first/n, count-entry offset and
   the GPU-written count, draw-ring offset, the first 8 draw records (32 words),
-  and the first 8 payload words.
+  and the first 8 payload words. For a direct task draw there is no
+  GPU-written count entry; the CPU workgroup count (`n`) is reported instead.
 - `TRACE convert ...` / `TRACE convert record[i] ...` — the last indirect
   conversion: source/destination, stride, max count, and up to four converted
   16-byte records.
@@ -109,8 +115,8 @@ that took at least 100 ms. For each such frame it dumps:
 - `TRACE fence wait_ms=...` — a `vkWaitForFences` call that blocked for at least
   100 ms.
 
-The readback is not a full BO dump. It is limited to the first eight slow
-frames, the first eight draw/payload records, and four converted records; a
+The readback is not a full BO dump. It is limited to the first eight frames of
+a slow run, the first eight draw/payload records, and four converted records; a
 normal 30 FPS run produces no `TRACE` lines. The values are read after the
 frame boundary, so they describe the last task pass/conversion/submit of that
 frame, not an arbitrary earlier draw.
