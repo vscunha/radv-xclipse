@@ -15849,6 +15849,36 @@ radv_xclipse_emit_task_draw(struct radv_cmd_buffer *cmd_buffer, const struct rad
    cmd_buffer->state.dirty |= RADV_CMD_DIRTY_COMPUTE_PIPELINE | RADV_CMD_DIRTY_RAY_TRACING_PIPELINE;
 }
 
+/* Direct mesh-only draw. The firmware's DISPATCH_MESH_DIRECT packet hangs this GPU, so go
+ * through the same conversion and DRAW_INDIRECT_MULTI path as an indirect mesh-only draw.
+ * A direct draw is just one 12-byte VkDrawMeshTasksIndirectCommandEXT record. */
+static void
+radv_xclipse_emit_mesh_draw_direct(struct radv_cmd_buffer *cmd_buffer, uint32_t x, uint32_t y, uint32_t z)
+{
+   const VkDrawMeshTasksIndirectCommandEXT cmd = {
+      .groupCountX = x,
+      .groupCountY = y,
+      .groupCountZ = z,
+   };
+   struct radv_draw_info info = {0};
+   unsigned offset;
+
+   if (!radv_cmd_buffer_upload_data(cmd_buffer, sizeof(cmd), &cmd, &offset)) {
+      vk_command_buffer_set_error(&cmd_buffer->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+      return;
+   }
+
+   info.indirect_va = radv_buffer_get_va(cmd_buffer->upload.upload_bo) + offset;
+   info.stride = sizeof(cmd);
+   info.count = 1;
+   info.count_va = 0;
+   info.indirect_va = radv_xclipse_convert_draw_mesh_tasks(cmd_buffer, &info, 1, false);
+   if (!info.indirect_va)
+      return;
+
+   radv_xclipse_emit_mesh_draw_indirect(cmd_buffer, info.indirect_va, 1, 0, 0);
+}
+
 #define RADV_XCLIPSE_MAX_TASK_DRAWS 64u
 #define RADV_XCLIPSE_MAX_MESH_DRAWS 16384u
 
@@ -15957,7 +15987,10 @@ radv_CmdDrawMeshTasksEXT(VkCommandBuffer commandBuffer, uint32_t x, uint32_t y, 
     * packet path. */
    const bool has_task = radv_cmdbuf_has_stage(cmd_buffer, MESA_SHADER_TASK);
    const bool emul = radv_device_physical(device)->xclipse_taskmesh_emul;
-   const char *path = emul && has_task ? "task-emul" : has_task ? "task-native" : "mesh-native-direct";
+   const char *path = emul && has_task ? "task-emul"
+                     : has_task        ? "task-native"
+                     : emul            ? "mesh-emul-direct"
+                                       : "mesh-native-direct";
 
    radv_xclipse_diag_pipeline(cmd_buffer);
 
@@ -15965,11 +15998,14 @@ radv_CmdDrawMeshTasksEXT(VkCommandBuffer commandBuffer, uint32_t x, uint32_t y, 
    if (radv_xclipse_mesh_diag_level() > 0 && radv_xclipse_mesh_diag_sample(&direct_draw_n))
       RADV_XCLIPSE_MESH_DIAG(1, "DRAW direct path=%s x=%u y=%u z=%u product=%llu count=%u has_task=%d emul=%d\n",
                              path, x, y, z, (unsigned long long)product, info.count, has_task, emul);
-   if (!has_task && emul && radv_xclipse_mesh_diag_level() > 0) {
-      static _Thread_local bool logged_mesh_native;
-      if (!logged_mesh_native) {
-         logged_mesh_native = true;
-         RADV_XCLIPSE_MESH_DIAG(1, "MESH direct path uses the native DISPATCH_MESH_DIRECT packet (not emulated)\n");
+   if (!has_task && radv_xclipse_mesh_diag_level() > 0) {
+      static _Thread_local bool logged_mesh_direct;
+      if (!logged_mesh_direct) {
+         logged_mesh_direct = true;
+         if (emul)
+            RADV_XCLIPSE_MESH_DIAG(1, "MESH direct path uses the converted DRAW_INDIRECT_MULTI emulation\n");
+         else
+            RADV_XCLIPSE_MESH_DIAG(1, "MESH direct path uses the native DISPATCH_MESH_DIRECT packet (not emulated)\n");
       }
    }
    const uint32_t ring_entries = radv_device_physical(device)->task_info.num_entries;
@@ -15986,6 +16022,8 @@ radv_CmdDrawMeshTasksEXT(VkCommandBuffer commandBuffer, uint32_t x, uint32_t y, 
       radv_xclipse_emit_task_draw(cmd_buffer, &info, x, y, z);
    } else if (has_task) {
       radv_emit_direct_taskmesh_draw_packets(device, &cmd_buffer->state, cs, cmd_buffer->gang.cs, x, y, z);
+   } else if (emul) {
+      radv_xclipse_emit_mesh_draw_direct(cmd_buffer, x, y, z);
    } else {
       radv_emit_direct_mesh_draw_packet(cmd_buffer, x, y, z);
    }
