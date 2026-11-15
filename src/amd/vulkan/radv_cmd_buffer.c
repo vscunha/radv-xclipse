@@ -15690,6 +15690,26 @@ xclipse_mesh_bisect(void)
    return v;
 }
 
+/* RADV_XCLIPSE_MESHFLUSH (diagnostic, read per draw, live): the two full cache flushes this path
+ * emits around every task dispatch, besides the L2/PFP bits RADV_XCLIPSE_TASKBAR covers. bit 1 (1) =
+ * no VS|PS flush before the dispatch ("mesh shaders of an earlier draw may still read the payload");
+ * bit 2 (2) = no CS|L1 flush after it ("the CP reads the draw ring and the mesh shaders read the
+ * payload"). Each is a partial flush of every wave of those stages, once per task draw. Rendering
+ * and the draw ring itself are undefined with either bit set; for timing only. */
+static int
+xclipse_mesh_flush_mask(void)
+{
+   const char *e = getenv("RADV_XCLIPSE_MESHFLUSH");
+   const int v = e && *e ? atoi(e) : 0;
+   static int last = -1;
+   if (v != last) {
+      last = v;
+      fprintf(stderr, "radv: xclipse: mesh flush %d: before the dispatch %s, after it %s\n", v,
+              v & 1 ? "off" : "on", v & 2 ? "off" : "on");
+   }
+   return v;
+}
+
 /* One task dispatch followed by the mesh draws it produced. indirect_va != 0 reads the grid from
  * memory. Ring entries [0, n) are used, counted from the workgroup 'first' along x. */
 static void
@@ -15742,9 +15762,14 @@ radv_xclipse_emit_task_dispatch_draw(struct radv_cmd_buffer *cmd_buffer, const u
          "(rasterization will be corrupt)\n",
          grid[0], grid[1], grid[2], (unsigned long long)product, max_entries, max_entries);
 
+   const int bisect = xclipse_mesh_bisect();
+   const int flush_mask = xclipse_mesh_flush_mask();
+
    /* Mesh shaders of an earlier draw may still read the payload ring. */
-   cmd_buffer->state.flush_bits |= AC_BARRIER_SYNC_VS | AC_BARRIER_SYNC_PS;
-   radv_emit_cache_flush(cmd_buffer, false);
+   if (!(flush_mask & 1)) {
+      cmd_buffer->state.flush_bits |= AC_BARRIER_SYNC_VS | AC_BARRIER_SYNC_PS;
+      radv_emit_cache_flush(cmd_buffer, false);
+   }
 
    radeon_check_space(device->ws, cs->b, 64);
 
@@ -15808,10 +15833,12 @@ radv_xclipse_emit_task_dispatch_draw(struct radv_cmd_buffer *cmd_buffer, const u
    /* The CP reads the draw ring and the mesh shaders read the payload. Radv asks for INV_L2 | WB_L2 here
     * too; RADV_XCLIPSE_TASKBAR=1 leaves them out (ac_gpu_info.c "light task barrier").
     */
-   cmd_buffer->state.flush_bits |= AC_BARRIER_SYNC_CS | AC_BARRIER_INV_VMEM | AC_BARRIER_INV_SMEM;
-   if (!ac_xclipse_light_task_barrier(&radv_device_physical(device)->info))
-      cmd_buffer->state.flush_bits |= AC_BARRIER_INV_L2 | AC_BARRIER_WB_L2 | AC_BARRIER_PFP_SYNC_ME;
-   radv_emit_cache_flush(cmd_buffer, false);
+   if (!(flush_mask & 2)) {
+      cmd_buffer->state.flush_bits |= AC_BARRIER_SYNC_CS | AC_BARRIER_INV_VMEM | AC_BARRIER_INV_SMEM;
+      if (!ac_xclipse_light_task_barrier(&radv_device_physical(device)->info))
+         cmd_buffer->state.flush_bits |= AC_BARRIER_INV_L2 | AC_BARRIER_WB_L2 | AC_BARRIER_PFP_SYNC_ME;
+      radv_emit_cache_flush(cmd_buffer, false);
+   }
 
    if (cmd_buffer->state.uses_drawid) {
       radeon_check_space(device->ws, cs->b, 4);
