@@ -15855,33 +15855,33 @@ radv_xclipse_emit_task_draw(struct radv_cmd_buffer *cmd_buffer, const struct rad
 }
 
 /* Direct mesh-only draw. The firmware's DISPATCH_MESH_DIRECT packet hangs this GPU, so go
- * through the same conversion and DRAW_INDIRECT_MULTI path as an indirect mesh-only draw.
- * A direct draw is just one 12-byte VkDrawMeshTasksIndirectCommandEXT record. */
+ * through the same DRAW_INDIRECT_MULTI path as an indirect mesh-only draw. The direct grid is
+ * known on the CPU, so build the converted 16-byte record directly; the meta conversion would
+ * disturb the graphics state bound by radv_before_taskmesh_draw(). */
 static void
 radv_xclipse_emit_mesh_draw_direct(struct radv_cmd_buffer *cmd_buffer, uint32_t x, uint32_t y, uint32_t z)
 {
-   const VkDrawMeshTasksIndirectCommandEXT cmd = {
-      .groupCountX = x,
-      .groupCountY = y,
-      .groupCountZ = z,
+   const uint64_t product = (uint64_t)x * y * z;
+   const uint32_t record[4] = {
+      (uint32_t)product,
+      1,
+      x | (y << 16),
+      z,
    };
-   struct radv_draw_info info = {0};
    unsigned offset;
 
-   if (!radv_cmd_buffer_upload_data(cmd_buffer, sizeof(cmd), &cmd, &offset)) {
+   static _Thread_local unsigned warned_product;
+   if (product > UINT32_MAX && warned_product++ < 8)
+      RADV_XCLIPSE_MESH_DIAG_WARN("mesh direct grid %u,%u,%u product=%llu overflows the 32-bit draw count\n", x, y,
+                                  z, (unsigned long long)product);
+
+   if (!radv_cmd_buffer_upload_data(cmd_buffer, sizeof(record), record, &offset)) {
       vk_command_buffer_set_error(&cmd_buffer->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
       return;
    }
 
-   info.indirect_va = radv_buffer_get_va(cmd_buffer->upload.upload_bo) + offset;
-   info.stride = sizeof(cmd);
-   info.count = 1;
-   info.count_va = 0;
-   info.indirect_va = radv_xclipse_convert_draw_mesh_tasks(cmd_buffer, &info, 1, false);
-   if (!info.indirect_va)
-      return;
-
-   radv_xclipse_emit_mesh_draw_indirect(cmd_buffer, info.indirect_va, 1, 0, 0);
+   const uint64_t dst_va = radv_buffer_get_va(cmd_buffer->upload.upload_bo) + offset;
+   radv_xclipse_emit_mesh_draw_indirect(cmd_buffer, dst_va, 1, 0, 0);
 }
 
 #define RADV_XCLIPSE_MAX_TASK_DRAWS 64u
