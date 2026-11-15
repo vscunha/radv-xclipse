@@ -54,6 +54,7 @@
 #include "util/perf/u_trace.h"
 #include "radv_xclipse_prof.h"
 #include "radv_xclipse_mesh_diag.h"
+#include "radv_xclipse_native_trace.h"
 
 enum {
    RADV_PREFETCH_VS = (1 << 0),
@@ -15603,6 +15604,8 @@ radv_xclipse_convert_draw_mesh_tasks(struct radv_cmd_buffer *cmd_buffer, const s
 
    radv_xclipse_convert_mesh_tasks(cmd_buffer, info->indirect_va, info->stride, info->count_va, max_count, task,
                                    dst_va);
+   radv_xclipse_native_trace_record_convert(cmd_buffer, info->indirect_va, info->stride, info->count_va, max_count,
+                                           task, dst_va, offset);
    return dst_va;
 }
 
@@ -15793,6 +15796,8 @@ radv_xclipse_emit_task_dispatch_draw(struct radv_cmd_buffer *cmd_buffer, const u
       radeon_end();
    }
 
+   radv_xclipse_native_trace_record_task(cmd_buffer, grid, first, n, indirect_va != 0, count_va, draw_ring_va,
+                                         mesh_draw_count, draw_id, task_shader, mesh_shader);
    radv_xclipse_emit_mesh_draw_indirect(cmd_buffer, draw_ring_va, indirect_va ? max_entries : n,
                                         indirect_va ? count_va : 0,
                                         radv_get_user_sgpr(mesh_shader, AC_UD_TASK_RING_ENTRY));

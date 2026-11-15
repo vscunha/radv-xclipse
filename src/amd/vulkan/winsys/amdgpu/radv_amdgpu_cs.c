@@ -25,6 +25,7 @@
 #include <android/log.h>
 #include "radv_amdgpu_winsys.h"
 #include "radv_radeon_winsys.h"
+#include "radv_xclipse_native_trace.h"
 #include "vk_xclipse_perf.h"
 #include "sid.h"
 #include "vk_drm_syncobj.h"
@@ -2191,6 +2192,9 @@ radv_amdgpu_cs_submit(struct radv_amdgpu_ctx *ctx, struct radv_amdgpu_cs_request
 
    if (xperf)
       vk_xclipse_perf_submit(os_time_get_nano() - xperf_t0);
+
+   radv_xclipse_native_trace_record_submit(request->ip_type, request->ring, request->number_of_ibs,
+                                           request->num_handles, request->seq_no, has_user_fence, r);
 
    if (r) {
       /* Read the GPU busy/stall registers right after the GPU refused work. No BO, no CS, no

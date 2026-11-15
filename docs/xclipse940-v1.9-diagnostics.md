@@ -1,8 +1,12 @@
 # Xclipse 940 v1.9 task/mesh diagnostics
 
-This branch is **v1.9.0 (`cc87fdf`) plus opt-in diagnostics**. It does not
-change the command stream, the emulation decision, or any shader. It is meant to
-find out which v1.9 task/mesh path breaks emulated rendering.
+This branch is **v1.9.0 (`cc87fdf`) plus opt-in diagnostics and the direct
+mesh-only fix**. The fix routes `vkCmdDrawMeshTasksEXT` with `emul=1` and no
+task shader through the existing conversion + `DRAW_INDIRECT_MULTI` path; it no
+longer emits the firmware `DISPATCH_MESH_DIRECT` packet that the code documents
+as hanging. The diagnostics still do not change the command stream for other
+paths. The branch is meant to find out which v1.9 task/mesh path breaks
+emulated rendering.
 
 ## Enable
 
@@ -14,7 +18,11 @@ RADV_XCLIPSE_MESH_DIAG=1
 
 Level 1 prints device/ring/pipeline information, **sampled** application-draw
 summaries, and rate-limited warnings. Level 2 also prints **sampled** ring
-passes, indirect conversions, and the `DRAW_INDIRECT_MULTI` arguments.
+passes, indirect conversions, and the `DRAW_INDIRECT_MULTI` arguments. Level 3
+also enables the bounded native-path readback described below: the first eight
+Android frames slower than 100 ms dump the last task count/draw-ring/payload
+words, the last conversion record, the last submit metadata, and slow
+`vkWaitForFences` calls.
 
 Sampling is per recording thread: the first 256 records, then every 1024th
 record. Pipeline changes are logged for the first 32 task/mesh pair changes per
@@ -38,10 +46,11 @@ artifact ZIP itself.
 - `PIPE task=... wg=... wave=...` / `PIPE mesh=... wg=... has_task=...` — the
   task and mesh shader local sizes and whether the mesh shader was compiled with
   a task shader.
-- `DRAW direct path=...` — `task-emul`, `task-native`, or `mesh-native-direct`.
-  `mesh-native-direct` means a mesh-only direct draw still used the firmware
-  `DISPATCH_MESH_DIRECT` packet; it is not the v1.9 emulation. The pipeline
-  line is emitted for this path too.
+- `DRAW direct path=...` — `task-emul`, `task-native`, `mesh-emul-direct`, or
+  `mesh-native-direct`. `mesh-emul-direct` is the fixed direct mesh-only path
+  (converted to `DRAW_INDIRECT_MULTI`); `mesh-native-direct` is the native
+  firmware packet used only when the emulation is disabled. The pipeline line is
+  emitted for both paths.
 - `TASK draw x=... y=... z=... product=...` for a direct task draw, or
   `TASK indirect count=... stride=...` for an indirect task draw. The indirect
   count is the number of task-draw commands, not the application workgroup grid.
@@ -71,8 +80,10 @@ artifact ZIP itself.
   processed. This warning does **not** prove that the actual GPU-written count
   exceeded the cap, or that draws were dropped; the actual count is not visible
   on the CPU.
-- `MESH direct path uses the native DISPATCH_MESH_DIRECT packet` — if rendering
-  breaks only with mesh-only direct draws, this path is the suspect.
+- `MESH direct path uses the native DISPATCH_MESH_DIRECT packet` — only when
+  the emulation is disabled (or an old driver is in use); with emulation enabled
+  the direct path now logs `MESH direct path uses the converted
+  DRAW_INDIRECT_MULTI emulation`.
 - `task direct pass ... n=0` — the CPU could not select any ring record for a
   direct pass.
 
@@ -81,9 +92,33 @@ by these CPU-side checks; it is produced in the shader and can differ from the
 application task grid. Indirect grids and task-emitted mesh grids are likewise
 not inspected.
 
+## Level 3 native-path readback
+
+Level 3 is a targeted trace for a clean level-1/2 log. At the Android frame
+boundary (`QueueSignalReleaseImageANDROID`) it reports the first eight frames
+that took at least 100 ms. For each such frame it dumps:
+
+- `TRACE task ...` — the last task pass: grid, first/n, count-entry offset and
+  the GPU-written count, draw-ring offset, the first 8 draw records (32 words),
+  and the first 8 payload words.
+- `TRACE convert ...` / `TRACE convert record[i] ...` — the last indirect
+  conversion: source/destination, stride, max count, and up to four converted
+  16-byte records.
+- `TRACE submit ...` — the last submit's IP type, ring, IB count, BO-list count,
+  sequence number, user-fence flag, and ioctl result.
+- `TRACE fence wait_ms=...` — a `vkWaitForFences` call that blocked for at least
+  100 ms.
+
+The readback is not a full BO dump. It is limited to the first eight slow
+frames, the first eight draw/payload records, and four converted records; a
+normal 30 FPS run produces no `TRACE` lines. The values are read after the
+frame boundary, so they describe the last task pass/conversion/submit of that
+frame, not an arbitrary earlier draw.
+
 ## What this cannot tell you
 
-The log does not read back the GPU-written ring records or the task payload.
-A clean log only rules out the CPU-side cases printed above, within the sampling
-and warning limits. If the log is clean, the next step is a GPU-side readback of
-the ring and payload, not another build with more CPU logging.
+The level-1/2 log alone does not read back the GPU-written ring records or the
+task payload. A clean level-1/2 log only rules out the CPU-side cases printed
+above, within the sampling and warning limits. Level 3 adds the bounded readback
+above, but it still cannot prove how the GPU executed a record, and it does not
+inspect a full payload or every draw in the frame.

@@ -38,6 +38,12 @@
 #include "vk_xclipse_perf.h"
 #include "util/u_xclipse_prof.h"
 
+/* Defined by the RADV Xclipse build only; weak so other drivers keep linking. */
+#if defined(__GNUC__)
+void radv_xclipse_native_trace_fence_wait(uint32_t fence_count, uint32_t wait_all, int result,
+                                          uint64_t wait_ns) __attribute__((weak));
+#endif
+
 static VkExternalFenceHandleTypeFlags
 vk_sync_fence_import_types(const struct vk_sync_type *type)
 {
@@ -284,15 +290,21 @@ vk_common_WaitForFences(VkDevice _device,
    /* Perf accounting: time blocked on the GPU (GPU-limited vs app-CPU-limited). Off by default. */
    const bool xperf = vk_xclipse_perf_enabled();
    const bool xprof = u_xclipse_prof_active();
-   const uint64_t xperf_t0 = xperf || xprof ? os_time_get_nano() : 0;
+   const uint64_t wait_t0 = os_time_get_nano();
 
    VkResult result = vk_sync_wait_many(device, fenceCount, waits,
                                        wait_flags, abs_timeout_ns);
 
+   const uint64_t wait_ns = os_time_get_nano() - wait_t0;
    if (xperf)
-      vk_xclipse_perf_wait(os_time_get_nano() - xperf_t0);
+      vk_xclipse_perf_wait(wait_ns);
    if (xprof)
-      u_xclipse_prof_wait(U_XCLIPSE_WAIT_CLIENT_FENCE, os_time_get_nano() - xperf_t0);
+      u_xclipse_prof_wait(U_XCLIPSE_WAIT_CLIENT_FENCE, wait_ns);
+#if defined(__GNUC__)
+   /* The Xclipse trace is gated by RADV_XCLIPSE_MESH_DIAG=3 inside the hook. */
+   if (radv_xclipse_native_trace_fence_wait)
+      radv_xclipse_native_trace_fence_wait(fenceCount, waitAll, result, wait_ns);
+#endif
 
    STACK_ARRAY_FINISH(waits);
 

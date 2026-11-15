@@ -11,6 +11,12 @@
  *                           summaries, and rate-limited warnings
  * RADV_XCLIPSE_MESH_DIAG=2  also sampled ring passes, indirect conversions
  *                           and DRAW_INDIRECT_MULTI packet arguments
+ * RADV_XCLIPSE_MESH_DIAG=3  also the bounded native-path trace: the first
+ *                           eight Android frames slower than 100 ms dump the
+ *                           last task count/draw ring/payload words, the last
+ *                           conversion record, the last submit metadata and
+ *                           slow vkWaitForFences calls. Full BOs are never
+ *                           dumped.
  *
  * Lines are prefixed with "[X940-19]" so they can be filtered from a full
  * BananaNative log.

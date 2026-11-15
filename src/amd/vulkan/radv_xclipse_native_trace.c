@@ -1,0 +1,266 @@
+/*
+ * Copyright © 2026 JimVulkan
+ *
+ * SPDX-License-Identifier: MIT
+ *
+ * Bounded, opt-in trace for the Xclipse native task/mesh path. The trace is
+ * collected while recording and read back at the Android frame boundary. It
+ * never changes the command stream and never dumps a full BO.
+ */
+#include "radv_xclipse_native_trace.h"
+
+#include <stdio.h>
+
+#include "ac_gpu_info.h"
+#include "radv_cmd_buffer.h"
+#include "radv_device.h"
+#include "radv_physical_device.h"
+#include "radv_radeon_winsys.h"
+#include "radv_shader.h"
+#include "radv_xclipse_mesh_diag.h"
+#include "util/os_time.h"
+
+struct radv_xclipse_native_trace {
+   struct radv_device *device;
+
+   bool have_task;
+   bool task_indirect;
+   uint32_t task_grid[3];
+   uint32_t task_first;
+   uint32_t task_n;
+   uint32_t task_mesh_draw_count;
+   uint32_t task_draw_id;
+   uint64_t task_count_va;
+   uint64_t task_draw_ring_va;
+   const struct radv_shader *task;
+   const struct radv_shader *mesh;
+
+   bool have_convert;
+   bool convert_task;
+   uint64_t convert_src_va;
+   uint64_t convert_count_va;
+   uint64_t convert_dst_va;
+   uint32_t convert_stride;
+   uint32_t convert_max_count;
+   uint32_t convert_dst_offset;
+   struct radeon_winsys_bo *convert_upload_bo;
+
+   bool have_submit;
+   unsigned submit_ip_type;
+   unsigned submit_ring;
+   unsigned submit_ibs;
+   unsigned submit_handles;
+   uint64_t submit_seq_no;
+   bool submit_user_fence;
+   int submit_result;
+
+   uint64_t last_present_ns;
+   unsigned slow_presents;
+};
+
+static _Thread_local struct radv_xclipse_native_trace trace;
+
+static bool
+trace_enabled(void)
+{
+   return radv_xclipse_mesh_diag_level() >= 3;
+}
+
+void
+radv_xclipse_native_trace_record_task(struct radv_cmd_buffer *cmd_buffer, const uint32_t grid[3], uint32_t first,
+                                      uint32_t n, bool indirect, uint64_t count_va, uint64_t draw_ring_va,
+                                      uint32_t mesh_draw_count, uint32_t draw_id, const struct radv_shader *task,
+                                      const struct radv_shader *mesh)
+{
+   if (!trace_enabled())
+      return;
+
+   trace.device = radv_cmd_buffer_device(cmd_buffer);
+   trace.have_task = true;
+   trace.task_indirect = indirect;
+   trace.task_grid[0] = grid[0];
+   trace.task_grid[1] = grid[1];
+   trace.task_grid[2] = grid[2];
+   trace.task_first = first;
+   trace.task_n = n;
+   trace.task_mesh_draw_count = mesh_draw_count;
+   trace.task_draw_id = draw_id;
+   trace.task_count_va = count_va;
+   trace.task_draw_ring_va = draw_ring_va;
+   trace.task = task;
+   trace.mesh = mesh;
+}
+
+void
+radv_xclipse_native_trace_record_convert(struct radv_cmd_buffer *cmd_buffer, uint64_t src_va, uint32_t stride,
+                                         uint64_t count_va, uint32_t max_count, bool task, uint64_t dst_va,
+                                         uint32_t dst_offset)
+{
+   if (!trace_enabled())
+      return;
+
+   trace.device = radv_cmd_buffer_device(cmd_buffer);
+   trace.have_convert = true;
+   trace.convert_task = task;
+   trace.convert_src_va = src_va;
+   trace.convert_count_va = count_va;
+   trace.convert_dst_va = dst_va;
+   trace.convert_stride = stride;
+   trace.convert_max_count = max_count;
+   trace.convert_dst_offset = dst_offset;
+   trace.convert_upload_bo = cmd_buffer->upload.upload_bo;
+}
+
+void
+radv_xclipse_native_trace_record_submit(unsigned ip_type, unsigned ring, unsigned ibs, unsigned handles,
+                                        uint64_t seq_no, bool user_fence, int result)
+{
+   if (!trace_enabled())
+      return;
+
+   trace.have_submit = true;
+   trace.submit_ip_type = ip_type;
+   trace.submit_ring = ring;
+   trace.submit_ibs = ibs;
+   trace.submit_handles = handles;
+   trace.submit_seq_no = seq_no;
+   trace.submit_user_fence = user_fence;
+   trace.submit_result = result;
+}
+
+static void
+trace_task_ring(struct radv_device *device)
+{
+   const struct radv_physical_device *pdev = radv_device_physical(device);
+   struct radeon_winsys_bo *bo = device->xclipse_task_bo;
+
+   if (!bo) {
+      RADV_XCLIPSE_MESH_DIAG(3, "TRACE task ring absent\n");
+      return;
+   }
+
+   const uint64_t rings_va = radv_buffer_get_va(bo);
+   const uint32_t bo_size = pdev->task_info.bo_size_bytes;
+   const uint32_t count_off = (uint32_t)(trace.task_count_va - rings_va);
+   const uint32_t draw_off = (uint32_t)(trace.task_draw_ring_va - rings_va);
+   const uint32_t payload_off = pdev->task_info.payload_ring_offset;
+   const uint32_t *map = radv_buffer_map(device->ws, bo);
+
+   if (!map) {
+      RADV_XCLIPSE_MESH_DIAG(3, "TRACE task ring map failed bo_size=%u\n", bo_size);
+      return;
+   }
+
+   uint32_t count = 0;
+   if (count_off + sizeof(count) <= bo_size)
+      count = map[count_off / 4];
+   else
+      RADV_XCLIPSE_MESH_DIAG(3, "TRACE task count offset out of range off=%u bo_size=%u\n", count_off, bo_size);
+
+   RADV_XCLIPSE_MESH_DIAG(3,
+                          "TRACE task indirect=%u grid=%u,%u,%u first=%u n=%u mesh_draw_count=%u draw_id=%u "
+                          "count_off=%u count=%u draw_off=%u payload_off=%u task=%p mesh=%p\n",
+                          trace.task_indirect, trace.task_grid[0], trace.task_grid[1], trace.task_grid[2],
+                          trace.task_first, trace.task_n, trace.task_mesh_draw_count, trace.task_draw_id, count_off,
+                          count, draw_off, payload_off, (const void *)trace.task, (const void *)trace.mesh);
+
+   if (draw_off + 8 * AC_TASK_DRAW_ENTRY_BYTES <= bo_size) {
+      const uint32_t *d = &map[draw_off / 4];
+      RADV_XCLIPSE_MESH_DIAG(3,
+                             "TRACE draw0..7 %u,%u,%u,%u %u,%u,%u,%u %u,%u,%u,%u %u,%u,%u,%u "
+                             "%u,%u,%u,%u %u,%u,%u,%u %u,%u,%u,%u %u,%u,%u,%u\n",
+                             d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9], d[10], d[11], d[12],
+                             d[13], d[14], d[15], d[16], d[17], d[18], d[19], d[20], d[21], d[22], d[23], d[24],
+                             d[25], d[26], d[27], d[28], d[29], d[30], d[31]);
+   } else {
+      RADV_XCLIPSE_MESH_DIAG(3, "TRACE draw ring offset out of range off=%u bo_size=%u\n", draw_off, bo_size);
+   }
+
+   if (payload_off + 8 * sizeof(uint32_t) <= bo_size) {
+      const uint32_t *p = &map[payload_off / 4];
+      RADV_XCLIPSE_MESH_DIAG(3, "TRACE payload0..7 %u,%u,%u,%u,%u,%u,%u,%u\n", p[0], p[1], p[2], p[3], p[4], p[5],
+                             p[6], p[7]);
+   }
+
+   device->ws->buffer_unmap(device->ws, bo, false);
+}
+
+static void
+trace_converted_record(struct radv_device *device)
+{
+   struct radeon_winsys_bo *bo = trace.convert_upload_bo;
+
+   if (!bo) {
+      RADV_XCLIPSE_MESH_DIAG(3, "TRACE convert upload BO absent max=%u stride=%u task=%u\n",
+                             trace.convert_max_count, trace.convert_stride, trace.convert_task);
+      return;
+   }
+
+   const uint32_t *map = radv_buffer_map(device->ws, bo);
+   if (!map) {
+      RADV_XCLIPSE_MESH_DIAG(3, "TRACE convert upload map failed\n");
+      return;
+   }
+
+   const uint32_t *r = &map[trace.convert_dst_offset / 4];
+   const uint32_t records = trace.convert_max_count < 4 ? trace.convert_max_count : 4;
+   RADV_XCLIPSE_MESH_DIAG(3,
+                          "TRACE convert task=%u src=0x%llx count_va=0x%llx dst=0x%llx off=%u stride=%u max=%u "
+                          "records=%u\n",
+                          trace.convert_task, (unsigned long long)trace.convert_src_va,
+                          (unsigned long long)trace.convert_count_va, (unsigned long long)trace.convert_dst_va,
+                          trace.convert_dst_offset, trace.convert_stride, trace.convert_max_count, records);
+   for (uint32_t i = 0; i < records; i++) {
+      const uint32_t *rec = &r[i * 4];
+      RADV_XCLIPSE_MESH_DIAG(3, "TRACE convert record[%u] %u,%u,%u,%u\n", i, rec[0], rec[1], rec[2], rec[3]);
+   }
+   device->ws->buffer_unmap(device->ws, bo, false);
+}
+
+void
+radv_xclipse_native_trace_present(struct radv_device *device)
+{
+   if (!trace_enabled())
+      return;
+
+   const uint64_t now = os_time_get_nano();
+   const uint64_t frame_ns = trace.last_present_ns ? now - trace.last_present_ns : 0;
+   trace.last_present_ns = now;
+
+   /* A normal 30 FPS frame is ~33 ms; report only the first eight frames that
+    * took at least 100 ms. The trace state is the last task pass/conversion/
+    * submit of that frame, which is what the next readback needs. */
+   if (frame_ns < 100000000ull || trace.slow_presents >= 8)
+      return;
+
+   const unsigned slow = trace.slow_presents++;
+   RADV_XCLIPSE_MESH_DIAG(3,
+                          "TRACE present slow=%u frame_ms=%llu task=%u convert=%u submit=%u\n",
+                          slow, (unsigned long long)(frame_ns / 1000000ull), trace.have_task, trace.have_convert,
+                          trace.have_submit);
+
+   if (trace.device == device && trace.have_task)
+      trace_task_ring(device);
+   if (trace.device == device && trace.have_convert)
+      trace_converted_record(device);
+   if (trace.have_submit)
+      RADV_XCLIPSE_MESH_DIAG(3,
+                             "TRACE submit ip=%u ring=%u ibs=%u handles=%u seq=%llu user_fence=%u result=%d\n",
+                             trace.submit_ip_type, trace.submit_ring, trace.submit_ibs, trace.submit_handles,
+                             (unsigned long long)trace.submit_seq_no, trace.submit_user_fence, trace.submit_result);
+
+   /* Do not report the same frame's state at later slow presents. */
+   trace.have_task = false;
+   trace.have_convert = false;
+   trace.have_submit = false;
+}
+
+void
+radv_xclipse_native_trace_fence_wait(uint32_t fence_count, uint32_t wait_all, int result, uint64_t wait_ns)
+{
+   if (!trace_enabled() || wait_ns < 100000000ull)
+      return;
+
+   RADV_XCLIPSE_MESH_DIAG(3, "TRACE fence wait_ms=%llu fences=%u wait_all=%u result=%d\n",
+                          (unsigned long long)(wait_ns / 1000000ull), fence_count, wait_all, result);
+}

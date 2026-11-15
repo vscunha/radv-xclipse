@@ -15,6 +15,8 @@
 #include "radv_entrypoints.h"
 #include "radv_image.h"
 #include "radv_physical_device.h"
+#include "radv_queue.h"
+#include "radv_xclipse_native_trace.h"
 
 #if DETECT_OS_ANDROID
 #include <vulkan/vk_android_native_buffer.h>
@@ -280,6 +282,8 @@ radv_QueueSignalReleaseImageANDROID(VkQueue queue_h, uint32_t waitSemaphoreCount
 {
    /* The frame boundary on Android: the platform loader implements VK_KHR_swapchain and drives the
     * ICD through VK_ANDROID_native_buffer, so wsi_QueuePresentKHR is never reached. */
+   RADV_FROM_HANDLE(radv_queue, queue, queue_h);
+   radv_xclipse_native_trace_present(radv_queue_device(queue));
    vk_xclipse_perf_present();
    u_xclipse_prof_frame();
 
