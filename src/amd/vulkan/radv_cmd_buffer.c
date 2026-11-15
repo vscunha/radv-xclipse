@@ -15782,8 +15782,6 @@ radv_xclipse_emit_task_dispatch_draw(struct radv_cmd_buffer *cmd_buffer, const u
       radeon_end();
    }
 
-   const int bisect = xclipse_mesh_bisect();
-
    if (!(bisect & 1) && indirect_va) {
       /* No task workgroup runs for an empty grid, so the count has to start at zero. */
       ac_emit_cp_copy_data(cs->b, COPY_DATA_IMM, COPY_DATA_DST_MEM, 0, count_va, AC_CP_COPY_DATA_WR_CONFIRM, false);
