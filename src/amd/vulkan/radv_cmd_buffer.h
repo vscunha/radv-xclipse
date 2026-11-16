@@ -601,6 +601,14 @@ struct radv_cmd_buffer {
    uint32_t xclipse_batch_workgroups;
    uint32_t xclipse_batch_draws;
    uint64_t xclipse_batch_token;
+   const struct radv_shader *xclipse_batch_task;
+   const struct radv_shader *xclipse_batch_mesh;
+   uint32_t xclipse_batch_grid_loc;
+   uint32_t xclipse_batch_draw_id_loc;
+   uint32_t xclipse_batch_ring_entry_loc;
+   uint32_t xclipse_batch_mesh_ring_entry;
+   uint32_t xclipse_batch_initiator;
+   uint64_t xclipse_batch_draw_ring_va;
 };
 
 struct radv_msrtss_transient {

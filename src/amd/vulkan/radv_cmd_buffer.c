@@ -8639,6 +8639,14 @@ VKAPI_ATTR VkResult VKAPI_CALL
 radv_BeginCommandBuffer(VkCommandBuffer commandBuffer, const VkCommandBufferBeginInfo *pBeginInfo)
 {
    VK_FROM_HANDLE(radv_cmd_buffer, cmd_buffer, commandBuffer);
+
+   /* A recording that is thrown away must not carry a pending task batch into the next one.
+    * Discarded, not flushed: the packets of an abandoned recording are never submitted. */
+   cmd_buffer->xclipse_batch_workgroups = 0;
+   cmd_buffer->xclipse_batch_draws = 0;
+   cmd_buffer->xclipse_batch_token = 0;
+   cmd_buffer->xclipse_batch_task = NULL;
+   cmd_buffer->xclipse_batch_mesh = NULL;
    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
    const struct radv_physical_device *pdev = radv_device_physical(device);
    VkResult result = VK_SUCCESS;
@@ -11982,6 +11990,9 @@ VKAPI_ATTR void VKAPI_CALL
 radv_CmdBeginCustomResolveEXT(VkCommandBuffer commandBuffer, const VkBeginCustomResolveInfoEXT *pBeginCustomResolveInfo)
 {
    VK_FROM_HANDLE(radv_cmd_buffer, cmd_buffer, commandBuffer);
+
+   /* keep a pending xclipse task batch on the near side of this boundary */
+   radv_xclipse_task_batch_flush(cmd_buffer);
    const struct radv_rendering_state *render = &cmd_buffer->state.render;
 
    STACK_ARRAY(VkRenderingAttachmentInfo, color_atts, render->color_att_count);
@@ -15929,7 +15940,7 @@ xclipse_mesh_batch(void)
 {
    const char *e = getenv("RADV_XCLIPSE_MESHBATCH");
    const int v = e && *e ? atoi(e) : 0;
-   static int last = -1;
+   static _Thread_local int last = -1;
    if (v != last) {
       last = v;
       fprintf(stderr, "radv: xclipse: mesh batch %d: %s\n", v,
@@ -15952,44 +15963,76 @@ xclipse_task_state_token(struct radv_cmd_buffer *cmd_buffer)
    uint64_t t = 0x9e3779b97f4a7c15ull;
 
    t = t * 0x100000001b3ull + cmd_buffer->state.dirty;
+   t = t * 0x100000001b3ull + cmd_buffer->state.dirty_dynamic;
    t = t * 0x100000001b3ull + ((uint64_t)ds->dirty << 32 | ds->dirty_dynamic);
+   t = t * 0x100000001b3ull + ((uint64_t)ds->dirty_heaps << 8 | ds->valid_heaps);
    t = t * 0x100000001b3ull + (uint64_t)pc->need_upload + ((uint64_t)pc->size << 1);
+   for (unsigned i = 0; i < pc->size && i < MAX_PUSH_CONSTANTS_SIZE; i++)
+      t = t * 0x100000001b3ull + cmd_buffer->push_constants[i];
    t = t * 0x100000001b3ull + (uint64_t)(uintptr_t)cmd_buffer->state.shaders[MESA_SHADER_TASK];
    t = t * 0x100000001b3ull + (uint64_t)(uintptr_t)cmd_buffer->state.shaders[MESA_SHADER_MESH];
    t = t * 0x100000001b3ull + (uint64_t)cmd_buffer->state.uses_drawid;
    for (unsigned i = 0; i < MAX_SETS; i++)
       t = t * 0x100000001b3ull + ((uint64_t)(uintptr_t)ds->sets[i] >> 4);
+   for (unsigned i = 0; i < RADV_MAX_HEAPS; i++)
+      t = t * 0x100000001b3ull + cmd_buffer->descriptor_heaps[i];
    return t;
+}
+
+/* Everything the flush needs, taken when the batch opens: the deferred dispatch and draw must not be
+ * programmed with whatever pipeline happens to be bound when the batch is finally emitted. */
+static void
+xclipse_task_batch_capture(struct radv_cmd_buffer *cmd_buffer)
+{
+   struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
+   const struct radv_physical_device *pdev = radv_device_physical(device);
+   const struct radv_shader *task_shader = cmd_buffer->state.shaders[MESA_SHADER_TASK];
+   const struct radv_shader *mesh_shader = cmd_buffer->state.shaders[MESA_SHADER_MESH];
+
+   cmd_buffer->xclipse_batch_task = task_shader;
+   cmd_buffer->xclipse_batch_mesh = mesh_shader;
+   cmd_buffer->xclipse_batch_grid_loc = radv_get_user_sgpr_loc(task_shader, AC_UD_CS_GRID_SIZE);
+   cmd_buffer->xclipse_batch_draw_id_loc = radv_get_user_sgpr_loc(task_shader, AC_UD_CS_TASK_DRAW_ID);
+   cmd_buffer->xclipse_batch_ring_entry_loc = radv_get_user_sgpr_loc(task_shader, AC_UD_TASK_RING_ENTRY);
+   cmd_buffer->xclipse_batch_mesh_ring_entry = radv_get_user_sgpr(mesh_shader, AC_UD_TASK_RING_ENTRY);
+   cmd_buffer->xclipse_batch_initiator =
+      device->dispatch_initiator | S_00B800_CS_W32_EN(task_shader->info.wave_size == 32);
+   cmd_buffer->xclipse_batch_draw_ring_va =
+      radv_buffer_get_va(device->xclipse_task_bo) + pdev->task_info.draw_ring_offset;
 }
 
 void
 radv_xclipse_task_batch_flush(struct radv_cmd_buffer *cmd_buffer)
 {
    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
-   const struct radv_physical_device *pdev = radv_device_physical(device);
-   const struct radv_shader *task_shader = cmd_buffer->state.shaders[MESA_SHADER_TASK];
-   const struct radv_shader *mesh_shader = cmd_buffer->state.shaders[MESA_SHADER_MESH];
+   const struct radv_shader *task_shader = cmd_buffer->xclipse_batch_task;
+   const struct radv_shader *mesh_shader = cmd_buffer->xclipse_batch_mesh;
    struct radv_cmd_stream *cs = cmd_buffer->cs;
    const uint32_t total = cmd_buffer->xclipse_batch_workgroups;
 
    if (!total)
       return;
 
-   /* Cleared first: the barrier below comes back through radv_emit_cache_flush(), and the mesh draw
-    * through the same path a plain draw takes. */
+   /* Cleared first: the flushes below come back through radv_emit_cache_flush(), and the mesh draw
+    * through the same path a plain draw takes. A pending batch is never dropped, even if the shaders
+    * have been rebound since it opened: it is emitted with the metadata it was opened with. */
    cmd_buffer->xclipse_batch_workgroups = 0;
    cmd_buffer->xclipse_batch_draws = 0;
    cmd_buffer->xclipse_batch_token = 0;
 
-   if (!task_shader || !mesh_shader || !device->xclipse_task_bo)
+   const uint32_t grid_loc = cmd_buffer->xclipse_batch_grid_loc;
+   const uint32_t draw_id_loc = cmd_buffer->xclipse_batch_draw_id_loc;
+   const uint32_t ring_entry_loc = cmd_buffer->xclipse_batch_ring_entry_loc;
+   const uint64_t draw_ring_va = cmd_buffer->xclipse_batch_draw_ring_va;
+   uint32_t initiator = cmd_buffer->xclipse_batch_initiator;
+
+   if (!task_shader || !mesh_shader || !draw_ring_va)
       return;
 
-   const uint32_t grid_loc = radv_get_user_sgpr_loc(task_shader, AC_UD_CS_GRID_SIZE);
-   const uint32_t draw_id_loc = radv_get_user_sgpr_loc(task_shader, AC_UD_CS_TASK_DRAW_ID);
-   const uint32_t ring_entry_loc = radv_get_user_sgpr_loc(task_shader, AC_UD_TASK_RING_ENTRY);
-   const uint64_t rings_va = radv_buffer_get_va(device->xclipse_task_bo);
-   const uint64_t draw_ring_va = rings_va + pdev->task_info.draw_ring_offset;
-   uint32_t initiator = device->dispatch_initiator | S_00B800_CS_W32_EN(task_shader->info.wave_size == 32);
+   /* Mesh shaders of the previous batch may still read the payload ring, and the ring of this batch
+    * starts at entry zero again. Same protection the unbatched path emits before its dispatch. */
+   cmd_buffer->state.flush_bits |= AC_BARRIER_SYNC_VS | AC_BARRIER_SYNC_PS;
+   radv_emit_cache_flush(cmd_buffer, false);
 
    /* ring_entry = 0 and one linear workgroup per record: workgroup k of the batch writes entry k, so
     * the ring holds each draw's [0, n) window in submission order, exactly as the unbatched sequence
@@ -16024,7 +16067,12 @@ radv_xclipse_task_batch_flush(struct radv_cmd_buffer *cmd_buffer)
    radv_emit_cache_flush(cmd_buffer, false);
 
    radv_xclipse_emit_mesh_draw_indirect(cmd_buffer, draw_ring_va, total, 0,
-                                        radv_get_user_sgpr(mesh_shader, AC_UD_TASK_RING_ENTRY));
+                                        cmd_buffer->xclipse_batch_mesh_ring_entry);
+
+   /* Report the batch that was actually emitted, not the logical draws it was made of. */
+   const uint32_t batch_grid[3] = {total, 1, 1};
+   radv_xclipse_native_trace_record_task(cmd_buffer, batch_grid, 0, total, false, 0, draw_ring_va, total, 0,
+                                        task_shader, mesh_shader);
 }
 
 void
@@ -16073,9 +16121,12 @@ radv_xclipse_emit_task_draw(struct radv_cmd_buffer *cmd_buffer, const struct rad
                           x <= max_entries && !cmd_buffer->state.uses_drawid && task_shader &&
                           radv_get_user_sgpr_loc(task_shader, AC_UD_CS_TASK_DRAW_ID) == 0;
 
-   if (!batchable)
+   if (!batchable) {
       radv_xclipse_task_batch_flush(cmd_buffer);
+      radv_xclipse_emit_task_state(cmd_buffer);
+   }
 
+   bool batch_opened = false;
    if (batchable) {
       const uint64_t token = xclipse_task_state_token(cmd_buffer);
 
@@ -16086,7 +16137,8 @@ radv_xclipse_emit_task_draw(struct radv_cmd_buffer *cmd_buffer, const struct rad
 
       if (!cmd_buffer->xclipse_batch_workgroups) {
          radv_xclipse_emit_task_state(cmd_buffer);
-         cmd_buffer->xclipse_batch_token = xclipse_task_state_token(cmd_buffer);
+         xclipse_task_batch_capture(cmd_buffer);
+         batch_opened = true;
       }
 
       cmd_buffer->xclipse_batch_workgroups += x;
@@ -16115,6 +16167,11 @@ radv_xclipse_emit_task_draw(struct radv_cmd_buffer *cmd_buffer, const struct rad
    radv_mark_descriptors_dirty(cmd_buffer, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR);
    cmd_buffer->push_constant_stages |= VK_SHADER_STAGE_COMPUTE_BIT | RADV_RT_STAGE_BITS;
    cmd_buffer->state.dirty |= RADV_CMD_DIRTY_COMPUTE_PIPELINE | RADV_CMD_DIRTY_RAY_TRACING_PIPELINE;
+
+   /* Hashed after the tail, so the dirty bits this path sets itself do not make the next otherwise
+    * identical task draw look like a state change. */
+   if (batch_opened)
+      cmd_buffer->xclipse_batch_token = xclipse_task_state_token(cmd_buffer);
 }
 
 /* Direct mesh-only draw. The firmware's DISPATCH_MESH_DIRECT packet hangs this GPU, so go
@@ -16480,6 +16537,9 @@ radv_CmdExecuteGeneratedCommandsEXT(VkCommandBuffer commandBuffer, VkBool32 isPr
    VK_FROM_HANDLE(radv_indirect_command_layout, layout, pGeneratedCommandsInfo->indirectCommandsLayout);
    VK_FROM_HANDLE(radv_indirect_execution_set, ies, pGeneratedCommandsInfo->indirectExecutionSet);
    VK_FROM_HANDLE(radv_cmd_buffer, cmd_buffer, commandBuffer);
+
+   /* keep a pending xclipse task batch on the near side of this boundary */
+   radv_xclipse_task_batch_flush(cmd_buffer);
    const struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
    const struct radv_physical_device *pdev = radv_device_physical(device);
    const bool use_predication = radv_use_dgc_predication(cmd_buffer, pGeneratedCommandsInfo);
@@ -18380,6 +18440,10 @@ radv_begin_conditional_rendering(struct radv_cmd_buffer *cmd_buffer, uint64_t va
 void
 radv_end_conditional_rendering(struct radv_cmd_buffer *cmd_buffer)
 {
+   /* A draw recorded under the predicate must not be emitted after predication is
+    * disabled. */
+   radv_xclipse_task_batch_flush(cmd_buffer);
+
    struct radv_cond_render_state *cond_render = &cmd_buffer->state.cond_render;
 
    if (cmd_buffer->qf == RADV_QUEUE_GENERAL) {

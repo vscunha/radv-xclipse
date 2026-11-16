@@ -2608,6 +2608,10 @@ radv_CmdBeginQueryIndexedEXT(VkCommandBuffer commandBuffer, VkQueryPool queryPoo
                              VkQueryControlFlags flags, uint32_t index)
 {
    VK_FROM_HANDLE(radv_cmd_buffer, cmd_buffer, commandBuffer);
+
+   /* A pending xclipse task batch must not move across a query boundary: its snapshot
+    * would miss the draw that was recorded before it. */
+   radv_xclipse_task_batch_flush(cmd_buffer);
    VK_FROM_HANDLE(radv_query_pool, pool, queryPool);
    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
    struct radv_cmd_stream *cs = cmd_buffer->cs;
@@ -2637,6 +2641,10 @@ VKAPI_ATTR void VKAPI_CALL
 radv_CmdEndQueryIndexedEXT(VkCommandBuffer commandBuffer, VkQueryPool queryPool, uint32_t query, uint32_t index)
 {
    VK_FROM_HANDLE(radv_cmd_buffer, cmd_buffer, commandBuffer);
+
+   /* A pending xclipse task batch must not move across a query boundary: its snapshot
+    * would miss the draw that was recorded before it. */
+   radv_xclipse_task_batch_flush(cmd_buffer);
    VK_FROM_HANDLE(radv_query_pool, pool, queryPool);
    uint64_t va = radv_buffer_get_va(pool->bo);
    uint64_t avail_va = va + pool->availability_offset + 4 * query;
