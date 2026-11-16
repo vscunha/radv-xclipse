@@ -529,6 +529,9 @@ VKAPI_ATTR void VKAPI_CALL
 radv_CmdBlitImage2(VkCommandBuffer commandBuffer, const VkBlitImageInfo2 *pBlitImageInfo)
 {
    VK_FROM_HANDLE(radv_cmd_buffer, cmd_buffer, commandBuffer);
+
+   /* A pending xclipse task batch must not cross a transfer or a clear. */
+   radv_xclipse_task_batch_flush(cmd_buffer);
    VK_FROM_HANDLE(radv_image, src_image, pBlitImageInfo->srcImage);
    VK_FROM_HANDLE(radv_image, dst_image, pBlitImageInfo->dstImage);
 

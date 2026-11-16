@@ -594,6 +594,13 @@ struct radv_cmd_buffer {
    const struct radv_shader *xprof_ps;
    uintptr_t xprof_op; /* the function that began the current meta op (field profiler) */
    uint32_t xprof_rt;  /* pass slot + 1 opened by the current rendering, 0 outside one */
+
+   /* Xclipse task-draw batching (RADV_XCLIPSE_MESHBATCH): the task draws merged into the pending
+    * dispatch, the sum of their workgroups, and the task/mesh/descriptor state they were opened with.
+    * xclipse_batch_workgroups == 0 means nothing is pending. */
+   uint32_t xclipse_batch_workgroups;
+   uint32_t xclipse_batch_draws;
+   uint64_t xclipse_batch_token;
 };
 
 struct radv_msrtss_transient {
@@ -604,6 +611,16 @@ struct radv_msrtss_transient {
 };
 
 VK_DEFINE_HANDLE_CASTS(radv_cmd_buffer, vk.base, VkCommandBuffer, VK_OBJECT_TYPE_COMMAND_BUFFER)
+
+/* Emit the pending xclipse task-draw batch (one DISPATCH over all of its workgroups, one
+ * DRAW_INDIRECT_MULTI over the whole ring window). No-op when nothing is pending, so it is safe to
+ * call from every command that must keep its position relative to those draws. */
+void radv_xclipse_task_batch_flush(struct radv_cmd_buffer *cmd_buffer);
+
+/* Flush only when the pending batch was opened with state the driver has since changed, i.e. when a
+ * deferred draw would run under different shaders, descriptors or push constants than it was recorded
+ * with. Called before the state of the next draw is emitted. */
+void radv_xclipse_task_batch_flush_if_state_changed(struct radv_cmd_buffer *cmd_buffer);
 
 static inline struct radv_device *
 radv_cmd_buffer_device(const struct radv_cmd_buffer *cmd_buffer)

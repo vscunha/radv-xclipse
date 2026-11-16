@@ -221,6 +221,9 @@ VKAPI_ATTR void VKAPI_CALL
 radv_CmdResolveImage2(VkCommandBuffer commandBuffer, const VkResolveImageInfo2 *pResolveImageInfo)
 {
    VK_FROM_HANDLE(radv_cmd_buffer, cmd_buffer, commandBuffer);
+
+   /* A pending xclipse task batch must not cross a transfer or a clear. */
+   radv_xclipse_task_batch_flush(cmd_buffer);
    VK_FROM_HANDLE(radv_image, src_image, pResolveImageInfo->srcImage);
    VK_FROM_HANDLE(radv_image, dst_image, pResolveImageInfo->dstImage);
    VkImageLayout src_image_layout = pResolveImageInfo->srcImageLayout;

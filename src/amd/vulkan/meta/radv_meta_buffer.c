@@ -262,6 +262,9 @@ radv_CmdFillBuffer(VkCommandBuffer commandBuffer, VkBuffer dstBuffer, VkDeviceSi
                    uint32_t data)
 {
    VK_FROM_HANDLE(radv_cmd_buffer, cmd_buffer, commandBuffer);
+
+   /* A pending xclipse task batch must not cross a transfer or a clear. */
+   radv_xclipse_task_batch_flush(cmd_buffer);
    VK_FROM_HANDLE(radv_buffer, dst_buffer, dstBuffer);
 
    radv_suspend_conditional_rendering(cmd_buffer);
@@ -325,6 +328,9 @@ VKAPI_ATTR void VKAPI_CALL
 radv_CmdCopyBuffer2(VkCommandBuffer commandBuffer, const VkCopyBufferInfo2 *pCopyBufferInfo)
 {
    VK_FROM_HANDLE(radv_cmd_buffer, cmd_buffer, commandBuffer);
+
+   /* A pending xclipse task batch must not cross a transfer or a clear. */
+   radv_xclipse_task_batch_flush(cmd_buffer);
    VK_FROM_HANDLE(radv_buffer, src_buffer, pCopyBufferInfo->srcBuffer);
    VK_FROM_HANDLE(radv_buffer, dst_buffer, pCopyBufferInfo->dstBuffer);
    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
@@ -425,6 +431,9 @@ radv_CmdUpdateBuffer(VkCommandBuffer commandBuffer, VkBuffer dstBuffer, VkDevice
                      const void *pData)
 {
    VK_FROM_HANDLE(radv_cmd_buffer, cmd_buffer, commandBuffer);
+
+   /* A pending xclipse task batch must not cross a transfer or a clear. */
+   radv_xclipse_task_batch_flush(cmd_buffer);
    VK_FROM_HANDLE(radv_buffer, dst_buffer, dstBuffer);
    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
    const uint64_t dst_va = vk_buffer_address(&dst_buffer->vk, dstOffset);
