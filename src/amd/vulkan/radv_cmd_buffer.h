@@ -609,6 +609,14 @@ struct radv_cmd_buffer {
    uint32_t xclipse_batch_mesh_ring_entry;
    uint32_t xclipse_batch_initiator;
    uint64_t xclipse_batch_draw_ring_va;
+
+   /* Diagnostic bookkeeping for RADV_XCLIPSE_MESHBATCH: how many task draws were offered, how many
+    * batches were emitted, the largest batch, and why each flush happened (XCLIPSE_BATCH_REASON_*). */
+   uint32_t xclipse_diag_draws;
+   uint32_t xclipse_diag_batches;
+   uint32_t xclipse_diag_max;
+   uint32_t xclipse_diag_next_report;
+   uint32_t xclipse_diag_reasons[24];
 };
 
 struct radv_msrtss_transient {
@@ -629,6 +637,9 @@ void radv_xclipse_task_batch_flush(struct radv_cmd_buffer *cmd_buffer);
  * deferred draw would run under different shaders, descriptors or push constants than it was recorded
  * with. Called before the state of the next draw is emitted. */
 void radv_xclipse_task_batch_flush_if_state_changed(struct radv_cmd_buffer *cmd_buffer);
+
+/* Same, tagged with the boundary that asked for it (the diagnostic histogram). */
+void radv_xclipse_task_batch_flush_reason(struct radv_cmd_buffer *cmd_buffer, unsigned reason);
 
 static inline struct radv_device *
 radv_cmd_buffer_device(const struct radv_cmd_buffer *cmd_buffer)
