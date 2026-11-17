@@ -16018,27 +16018,6 @@ xclipse_task_batch_capture(struct radv_cmd_buffer *cmd_buffer)
       radv_buffer_get_va(device->xclipse_task_bo) + pdev->task_info.draw_ring_offset;
 }
 
-/* Why a pending batch was emitted. Printed as a histogram, so one device run says whether batches
- * merge at all and which boundary cuts them. */
-enum xclipse_batch_reason {
-   XCLIPSE_BATCH_REASON_STATE = 0,   /* the task/mesh/descriptor state moved on */
-   XCLIPSE_BATCH_REASON_MAX,         /* reached RADV_XCLIPSE_MESHBATCH */
-   XCLIPSE_BATCH_REASON_RING,        /* the ring window is full */
-   XCLIPSE_BATCH_REASON_DRAW,        /* an ordinary draw is being recorded */
-   XCLIPSE_BATCH_REASON_TASKMESH,    /* a mesh-only draw is being recorded */
-   XCLIPSE_BATCH_REASON_FLUSH,       /* radv_emit_cache_flush() */
-   XCLIPSE_BATCH_REASON_QUERY,       /* a query boundary */
-   XCLIPSE_BATCH_REASON_PREDICATE,   /* conditional rendering turned off */
-   XCLIPSE_BATCH_REASON_DGC,         /* execute generated commands */
-   XCLIPSE_BATCH_REASON_RESOLVE,     /* custom resolve rendering */
-   XCLIPSE_BATCH_REASON_DISPATCH,    /* a compute dispatch */
-   XCLIPSE_BATCH_REASON_BARRIER,     /* vkCmdPipelineBarrier */
-   XCLIPSE_BATCH_REASON_RENDERING,   /* begin/end rendering */
-   XCLIPSE_BATCH_REASON_EXECUTE,     /* vkCmdExecuteCommands */
-   XCLIPSE_BATCH_REASON_END,         /* vkEndCommandBuffer */
-   XCLIPSE_BATCH_REASON_TRANSFER,    /* copy/clear/blit/resolve/fill/update */
-   XCLIPSE_BATCH_REASON_OTHER,
-};
 
 static void
 xclipse_batch_stats(char *out, size_t out_size, struct radv_cmd_buffer *cmd_buffer)
