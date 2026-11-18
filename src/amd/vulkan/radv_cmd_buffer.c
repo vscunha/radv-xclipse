@@ -15979,6 +15979,30 @@ xclipse_task_state_token(struct radv_cmd_buffer *cmd_buffer)
    return t;
 }
 
+/* Batching diagnostics, module-wide on purpose: the game records and resets one command buffer per
+ * frame, so per-buffer counters would never accumulate past a frame. */
+static _Thread_local struct {
+   uint32_t seen;      /* task draws offered to the gate */
+   uint32_t batchable; /* ... that passed it */
+   uint32_t batches;   /* dispatched batches emitted */
+   uint32_t draws;     /* task draws that went into a batch */
+   uint32_t maxw;      /* most workgroups in one batch */
+   uint32_t gate[8];   /* why a draw failed the gate, XCLIPSE_GATE_* */
+   uint32_t reasons[24];
+   uint32_t next_report;
+} xb_diag;
+
+enum xclipse_gate_reason {
+   XCLIPSE_GATE_KNOB = 0, /* RADV_XCLIPSE_MESHBATCH <= 1 */
+   XCLIPSE_GATE_INDIRECT,
+   XCLIPSE_GATE_MULTIDIM,
+   XCLIPSE_GATE_EMPTY,
+   XCLIPSE_GATE_RING,   /* x > num_entries - 1 */
+   XCLIPSE_GATE_DRAWID, /* the task shader reads draw_id */
+   XCLIPSE_GATE_NOSHADER,
+   XCLIPSE_GATE_GRAPHICS_DRAWID,
+};
+
 /* RADV_XCLIPSE_MESHBATCH_LOOSE=1 ignores the state token: timing only, it merges draws whose
  * descriptors, push constants or dynamic state differ, which renders garbage. It exists to measure how
  * far the merge could go if the per-draw state were free. */
@@ -16026,16 +16050,22 @@ xclipse_batch_stats(char *out, size_t out_size, struct radv_cmd_buffer *cmd_buff
       "state", "max", "ring", "draw", "taskmesh", "flush", "query", "predicate", "dgc",
       "resolve", "dispatch", "barrier", "rendering", "execute", "end", "transfer", "other",
    };
+   static const char *const gates[] = {"knob", "indirect", "multidim", "empty", "ring", "drawid", "noshader",
+                                       "graphics_drawid"};
    size_t pos = 0;
-   pos += snprintf(out + pos, out_size - pos, "mesh batch stats: %u task draws in %u batches (avg %.2f, max %u)",
-                   cmd_buffer->xclipse_diag_draws, cmd_buffer->xclipse_diag_batches,
-                   cmd_buffer->xclipse_diag_batches ? (double)cmd_buffer->xclipse_diag_draws /
-                                                         (double)cmd_buffer->xclipse_diag_batches
-                                                   : 0.0,
-                   cmd_buffer->xclipse_diag_max);
+
+   pos += snprintf(out + pos, out_size - pos,
+                   "mesh batch stats: %u task draws seen, %u batchable, %u draws in %u batches (avg %.2f, max %u "
+                   "workgroups)",
+                   xb_diag.seen, xb_diag.batchable, xb_diag.draws, xb_diag.batches,
+                   xb_diag.batches ? (double)xb_diag.draws / (double)xb_diag.batches : 0.0, xb_diag.maxw);
+   pos += snprintf(out + pos, out_size - pos, "; gate:");
+   for (unsigned i = 0; i < ARRAY_SIZE(gates) && pos < out_size; i++)
+      pos += snprintf(out + pos, out_size - pos, " %s %u", gates[i], xb_diag.gate[i]);
+   pos += snprintf(out + pos, out_size - pos, "; flush:");
    for (unsigned i = 0; i < ARRAY_SIZE(names) && pos < out_size; i++)
-      if (cmd_buffer->xclipse_diag_reasons[i])
-         pos += snprintf(out + pos, out_size - pos, ", %s %u", names[i], cmd_buffer->xclipse_diag_reasons[i]);
+      if (xb_diag.reasons[i])
+         pos += snprintf(out + pos, out_size - pos, " %s %u", names[i], xb_diag.reasons[i]);
    snprintf(out + pos, out_size - pos, "\n");
 }
 
@@ -16058,11 +16088,10 @@ radv_xclipse_task_batch_flush_reason(struct radv_cmd_buffer *cmd_buffer, unsigne
    cmd_buffer->xclipse_batch_draws = 0;
    cmd_buffer->xclipse_batch_token = 0;
 
-   cmd_buffer->xclipse_diag_batches++;
-   cmd_buffer->xclipse_diag_reasons[reason < ARRAY_SIZE(cmd_buffer->xclipse_diag_reasons) ? reason
-                                                                                         : XCLIPSE_BATCH_REASON_OTHER]++;
-   if (total > cmd_buffer->xclipse_diag_max)
-      cmd_buffer->xclipse_diag_max = total;
+   xb_diag.batches++;
+   xb_diag.reasons[reason < ARRAY_SIZE(xb_diag.reasons) ? reason : XCLIPSE_BATCH_REASON_OTHER]++;
+   if (total > xb_diag.maxw)
+      xb_diag.maxw = total;
 
    const uint32_t grid_loc = cmd_buffer->xclipse_batch_grid_loc;
    const uint32_t draw_id_loc = cmd_buffer->xclipse_batch_draw_id_loc;
@@ -16169,9 +16198,41 @@ radv_xclipse_emit_task_draw(struct radv_cmd_buffer *cmd_buffer, const struct rad
    /* Consecutive task draws can share one DISPATCH: see xclipse_mesh_batch() above. Only the plain
     * direct 1-D case is merged, one pass, and only while the task state is untouched. */
    const int batch_max = xclipse_mesh_batch();
+   const uint32_t task_draw_id_loc = task_shader ? radv_get_user_sgpr_loc(task_shader, AC_UD_CS_TASK_DRAW_ID) : 0;
    const bool batchable = batch_max > 1 && !info->indirect_va && y == 1 && z == 1 && x > 0 &&
-                          x <= max_entries && !cmd_buffer->state.uses_drawid && task_shader &&
-                          radv_get_user_sgpr_loc(task_shader, AC_UD_CS_TASK_DRAW_ID) == 0;
+                          x <= max_entries && !cmd_buffer->state.uses_drawid && task_shader && task_draw_id_loc == 0;
+
+   /* Counted per task draw, so one run says which condition rejects them. */
+   xb_diag.seen++;
+   if (!batchable) {
+      if (batch_max <= 1)
+         xb_diag.gate[XCLIPSE_GATE_KNOB]++;
+      else if (info->indirect_va)
+         xb_diag.gate[XCLIPSE_GATE_INDIRECT]++;
+      else if (y != 1 || z != 1)
+         xb_diag.gate[XCLIPSE_GATE_MULTIDIM]++;
+      else if (x == 0)
+         xb_diag.gate[XCLIPSE_GATE_EMPTY]++;
+      else if (x > max_entries)
+         xb_diag.gate[XCLIPSE_GATE_RING]++;
+      else if (!task_shader)
+         xb_diag.gate[XCLIPSE_GATE_NOSHADER]++;
+      else if (cmd_buffer->state.uses_drawid)
+         xb_diag.gate[XCLIPSE_GATE_GRAPHICS_DRAWID]++;
+      else if (task_draw_id_loc)
+         xb_diag.gate[XCLIPSE_GATE_DRAWID]++;
+      else
+         xb_diag.gate[XCLIPSE_GATE_KNOB]++;
+   } else {
+      xb_diag.batchable++;
+   }
+
+   if (xb_diag.seen >= xb_diag.next_report) {
+      char line[640];
+      xb_diag.next_report = xb_diag.seen + 1024;
+      xclipse_batch_stats(line, sizeof(line), cmd_buffer);
+      fputs(line, stderr);
+   }
 
    if (!batchable) {
       radv_xclipse_task_batch_flush_reason(cmd_buffer, XCLIPSE_BATCH_REASON_OTHER);
@@ -16198,16 +16259,7 @@ radv_xclipse_emit_task_draw(struct radv_cmd_buffer *cmd_buffer, const struct rad
 
       cmd_buffer->xclipse_batch_workgroups += x;
       cmd_buffer->xclipse_batch_draws++;
-      cmd_buffer->xclipse_diag_draws++;
-
-      /* One line every 512 batches, so a device log says whether batches merge at all and which
-       * boundary cuts them. */
-      if (cmd_buffer->xclipse_diag_batches >= cmd_buffer->xclipse_diag_next_report) {
-         char line[512];
-         cmd_buffer->xclipse_diag_next_report = cmd_buffer->xclipse_diag_batches + 512;
-         xclipse_batch_stats(line, sizeof(line), cmd_buffer);
-         fputs(line, stderr);
-      }
+      xb_diag.draws++;
 
       radv_xclipse_native_trace_record_task(cmd_buffer, grid, 0, x, false, 0,
                                             radv_buffer_get_va(device->xclipse_task_bo) +

@@ -610,13 +610,6 @@ struct radv_cmd_buffer {
    uint32_t xclipse_batch_initiator;
    uint64_t xclipse_batch_draw_ring_va;
 
-   /* Diagnostic bookkeeping for RADV_XCLIPSE_MESHBATCH: how many task draws were offered, how many
-    * batches were emitted, the largest batch, and why each flush happened (XCLIPSE_BATCH_REASON_*). */
-   uint32_t xclipse_diag_draws;
-   uint32_t xclipse_diag_batches;
-   uint32_t xclipse_diag_max;
-   uint32_t xclipse_diag_next_report;
-   uint32_t xclipse_diag_reasons[24];
 };
 
 struct radv_msrtss_transient {
