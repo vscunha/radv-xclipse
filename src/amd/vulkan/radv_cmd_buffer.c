@@ -15989,7 +15989,7 @@ static _Thread_local struct {
    uint32_t maxw;      /* most workgroups in one batch */
    uint32_t gate[8];   /* why a draw failed the gate, XCLIPSE_GATE_* */
    uint32_t reasons[24];
-   uint32_t next_report;
+   uint32_t next_report; /* next draws-seen count that prints, 0 until the knob is on */
 } xb_diag;
 
 enum xclipse_gate_reason {
@@ -16202,9 +16202,12 @@ radv_xclipse_emit_task_draw(struct radv_cmd_buffer *cmd_buffer, const struct rad
    const bool batchable = batch_max > 1 && !info->indirect_va && y == 1 && z == 1 && x > 0 &&
                           x <= max_entries && !cmd_buffer->state.uses_drawid && task_shader && task_draw_id_loc == 0;
 
-   /* Counted per task draw, so one run says which condition rejects them. */
-   xb_diag.seen++;
-   if (!batchable) {
+   /* Counted per task draw, so one run says which condition rejects them. Only while the knob is on:
+    * at 0 and 1 this path is left exactly as it was, which is what a control run needs. */
+   if (batch_max > 1) {
+      xb_diag.seen++;
+   }
+   if (!batchable && batch_max > 1) {
       if (batch_max <= 1)
          xb_diag.gate[XCLIPSE_GATE_KNOB]++;
       else if (info->indirect_va)
@@ -16223,13 +16226,15 @@ radv_xclipse_emit_task_draw(struct radv_cmd_buffer *cmd_buffer, const struct rad
          xb_diag.gate[XCLIPSE_GATE_DRAWID]++;
       else
          xb_diag.gate[XCLIPSE_GATE_KNOB]++;
-   } else {
+   } else if (batchable) {
       xb_diag.batchable++;
    }
 
-   if (xb_diag.seen >= xb_diag.next_report) {
+   /* Every 256 batched-path draws, and at most 64 lines: the scene can hang, and the last line before
+    * it is the reading, so the report must not wait for a quiet moment that never comes. */
+   if (batch_max > 1 && xb_diag.seen >= xb_diag.next_report && xb_diag.next_report < 64 * 256) {
       char line[640];
-      xb_diag.next_report = xb_diag.seen + 1024;
+      xb_diag.next_report += 256;
       xclipse_batch_stats(line, sizeof(line), cmd_buffer);
       fputs(line, stderr);
    }
