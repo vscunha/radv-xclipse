@@ -979,7 +979,7 @@ radv_CmdCopyImage2(VkCommandBuffer commandBuffer, const VkCopyImageInfo2 *pCopyI
    VK_FROM_HANDLE(radv_cmd_buffer, cmd_buffer, commandBuffer);
 
    /* A pending xclipse task batch must not cross a transfer or a clear. */
-   radv_xclipse_task_batch_flush(cmd_buffer);
+   XCLIPSE_BATCH_FLUSH(cmd_buffer);
    VK_FROM_HANDLE(radv_image, src_image, pCopyImageInfo->srcImage);
    VK_FROM_HANDLE(radv_image, dst_image, pCopyImageInfo->dstImage);
    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);

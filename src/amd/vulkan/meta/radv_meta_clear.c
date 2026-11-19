@@ -1997,7 +1997,7 @@ radv_cmd_clear_image(VkCommandBuffer commandBuffer, VkImage image_h, VkImageLayo
    VK_FROM_HANDLE(radv_cmd_buffer, cmd_buffer, commandBuffer);
 
    /* A pending xclipse task batch must not cross a transfer or a clear. */
-   radv_xclipse_task_batch_flush(cmd_buffer);
+   XCLIPSE_BATCH_FLUSH(cmd_buffer);
    VK_FROM_HANDLE(radv_image, image, image_h);
    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
    const struct radv_physical_device *pdev = radv_device_physical(device);
@@ -2088,7 +2088,7 @@ radv_CmdClearAttachments(VkCommandBuffer commandBuffer, uint32_t attachmentCount
    VK_FROM_HANDLE(radv_cmd_buffer, cmd_buffer, commandBuffer);
 
    /* A pending xclipse task batch must not cross a transfer or a clear. */
-   radv_xclipse_task_batch_flush(cmd_buffer);
+   XCLIPSE_BATCH_FLUSH(cmd_buffer);
    enum ac_barrier_flags pre_flush = 0;
    enum ac_barrier_flags post_flush = 0;
 

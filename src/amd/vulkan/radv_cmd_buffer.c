@@ -9366,7 +9366,7 @@ radv_EndCommandBuffer(VkCommandBuffer commandBuffer)
 {
    VK_FROM_HANDLE(radv_cmd_buffer, cmd_buffer, commandBuffer);
 
-   radv_xclipse_task_batch_flush_reason(cmd_buffer, XCLIPSE_BATCH_REASON_END);
+   XCLIPSE_BATCH_FLUSH_TAG(cmd_buffer, "end");
    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
    ASSERTED const struct radv_physical_device *pdev = radv_device_physical(device);
    struct radv_cmd_stream *cs = cmd_buffer->cs;
@@ -11009,7 +11009,7 @@ radv_CmdExecuteCommands(VkCommandBuffer commandBuffer, uint32_t commandBufferCou
 {
    VK_FROM_HANDLE(radv_cmd_buffer, primary, commandBuffer);
 
-   radv_xclipse_task_batch_flush_reason(primary, XCLIPSE_BATCH_REASON_EXECUTE);
+   XCLIPSE_BATCH_FLUSH_TAG(primary, "execute");
    struct radv_device *device = radv_cmd_buffer_device(primary);
    const struct radv_physical_device *pdev = radv_device_physical(device);
    const bool is_gfx_or_ace = primary->qf == RADV_QUEUE_GENERAL || primary->qf == RADV_QUEUE_COMPUTE;
@@ -11945,7 +11945,7 @@ radv_CmdBeginRendering(VkCommandBuffer commandBuffer, const VkRenderingInfo *pRe
 {
    VK_FROM_HANDLE(radv_cmd_buffer, cmd_buffer, commandBuffer);
 
-   radv_xclipse_task_batch_flush_reason(cmd_buffer, XCLIPSE_BATCH_REASON_RENDERING);
+   XCLIPSE_BATCH_FLUSH(cmd_buffer);
 
    if (unlikely(cmd_buffer->xprof_slot))
       radv_xprof_begin_rendering(cmd_buffer, pRenderingInfo);
@@ -11981,7 +11981,7 @@ radv_CmdEndRendering2KHR(VkCommandBuffer commandBuffer, const VkRenderingEndInfo
 {
    VK_FROM_HANDLE(radv_cmd_buffer, cmd_buffer, commandBuffer);
 
-   radv_xclipse_task_batch_flush_reason(cmd_buffer, XCLIPSE_BATCH_REASON_RENDERING);
+   XCLIPSE_BATCH_FLUSH(cmd_buffer);
 
    radv_cmd_buffer_end_rendering(cmd_buffer, pRenderingEndInfo);
 }
@@ -11992,7 +11992,7 @@ radv_CmdBeginCustomResolveEXT(VkCommandBuffer commandBuffer, const VkBeginCustom
    VK_FROM_HANDLE(radv_cmd_buffer, cmd_buffer, commandBuffer);
 
    /* keep a pending xclipse task batch on the near side of this boundary */
-   radv_xclipse_task_batch_flush_reason(cmd_buffer, XCLIPSE_BATCH_REASON_RESOLVE);
+   XCLIPSE_BATCH_FLUSH(cmd_buffer);
    const struct radv_rendering_state *render = &cmd_buffer->state.render;
 
    STACK_ARRAY(VkRenderingAttachmentInfo, color_atts, render->color_att_count);
@@ -14960,7 +14960,7 @@ radv_before_draw(struct radv_cmd_buffer *cmd_buffer, const struct radv_draw_info
 
    /* Any draw other than a batched xclipse task draw must not be recorded between the task draws of a
     * pending batch and their deferred mesh draws. */
-   radv_xclipse_task_batch_flush_reason(cmd_buffer, XCLIPSE_BATCH_REASON_DRAW);
+   XCLIPSE_BATCH_FLUSH(cmd_buffer);
 
    if (unlikely(cmd_buffer->xprof_pass))
       radv_xprof_draw_slow(cmd_buffer, drawCount);
@@ -15092,7 +15092,7 @@ radv_before_taskmesh_draw(struct radv_cmd_buffer *cmd_buffer, const struct radv_
    /* A task draw may join the pending batch, so only flush when the state it would need has changed;
     * a mesh-only draw can never join one. */
    if (!cmd_buffer->state.shaders[MESA_SHADER_TASK])
-      radv_xclipse_task_batch_flush_reason(cmd_buffer, XCLIPSE_BATCH_REASON_TASKMESH);
+      XCLIPSE_BATCH_FLUSH(cmd_buffer);
    else
       radv_xclipse_task_batch_flush_if_state_changed(cmd_buffer);
 
@@ -15981,7 +15981,17 @@ xclipse_task_state_token(struct radv_cmd_buffer *cmd_buffer)
 
 /* Batching diagnostics, module-wide on purpose: the game records and resets one command buffer per
  * frame, so per-buffer counters would never accumulate past a frame. */
+#define XCLIPSE_MAX_FLUSH_SITES 32
+
+struct xclipse_flush_site {
+   const char *file; /* basename, or a tag such as "state" for the accumulator's own boundaries */
+   int line;
+   uint32_t count;
+};
+
 static _Thread_local struct {
+   struct xclipse_flush_site sites[XCLIPSE_MAX_FLUSH_SITES];
+   uint32_t n_sites;
    uint32_t seen;      /* task draws offered to the gate */
    uint32_t batchable; /* ... that passed it */
    uint32_t batches;   /* dispatched batches emitted */
@@ -16015,7 +16025,10 @@ xclipse_mesh_batch_loose(void)
    if (v != last) {
       last = v;
       fprintf(stderr, "radv: xclipse: mesh batch loose %d: %s\n", v,
-              v ? "the state token is ignored, rendering is wrong" : "a batch ends when its state changes");
+              v >= 2 ? "every boundary is ignored too, so a batch spans anything: wrong picture, upper bound on "
+                       "the merge"
+                     : v ? "the state token is ignored, rendering is wrong"
+                         : "a batch ends when its state changes");
    }
    return v;
 }
@@ -16046,10 +16059,6 @@ xclipse_task_batch_capture(struct radv_cmd_buffer *cmd_buffer)
 static void
 xclipse_batch_stats(char *out, size_t out_size, struct radv_cmd_buffer *cmd_buffer)
 {
-   static const char *const names[] = {
-      "state", "max", "ring", "draw", "taskmesh", "flush", "query", "predicate", "dgc",
-      "resolve", "dispatch", "barrier", "rendering", "execute", "end", "transfer", "other",
-   };
    static const char *const gates[] = {"knob", "indirect", "multidim", "empty", "ring", "drawid", "noshader",
                                        "graphics_drawid"};
    size_t pos = 0;
@@ -16062,15 +16071,38 @@ xclipse_batch_stats(char *out, size_t out_size, struct radv_cmd_buffer *cmd_buff
    pos += snprintf(out + pos, out_size - pos, "; gate:");
    for (unsigned i = 0; i < ARRAY_SIZE(gates) && pos < out_size; i++)
       pos += snprintf(out + pos, out_size - pos, " %s %u", gates[i], xb_diag.gate[i]);
-   pos += snprintf(out + pos, out_size - pos, "; flush:");
-   for (unsigned i = 0; i < ARRAY_SIZE(names) && pos < out_size; i++)
-      if (xb_diag.reasons[i])
-         pos += snprintf(out + pos, out_size - pos, " %s %u", names[i], xb_diag.reasons[i]);
+   pos += snprintf(out + pos, out_size - pos, "; flush at:");
+   for (uint32_t i = 0; i < xb_diag.n_sites && pos < out_size; i++) {
+      const struct xclipse_flush_site *site = &xb_diag.sites[i];
+      const char *slash = site->file ? strrchr(site->file, '/') : NULL;
+      if (site->line)
+         pos += snprintf(out + pos, out_size - pos, " %s:%d %u", slash ? slash + 1 : site->file, site->line,
+                         site->count);
+      else
+         pos += snprintf(out + pos, out_size - pos, " %s %u", site->file, site->count);
+   }
    snprintf(out + pos, out_size - pos, "\n");
 }
 
+static void
+xclipse_flush_site(const char *file, int line)
+{
+   for (uint32_t i = 0; i < xb_diag.n_sites; i++) {
+      if (xb_diag.sites[i].file == file && xb_diag.sites[i].line == line) {
+         xb_diag.sites[i].count++;
+         return;
+      }
+   }
+   if (xb_diag.n_sites < XCLIPSE_MAX_FLUSH_SITES) {
+      xb_diag.sites[xb_diag.n_sites].file = file;
+      xb_diag.sites[xb_diag.n_sites].line = line;
+      xb_diag.sites[xb_diag.n_sites].count = 1;
+      xb_diag.n_sites++;
+   }
+}
+
 void
-radv_xclipse_task_batch_flush_reason(struct radv_cmd_buffer *cmd_buffer, unsigned reason)
+radv_xclipse_task_batch_flush_at(struct radv_cmd_buffer *cmd_buffer, const char *_file, int _line)
 {
    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
    const struct radv_shader *task_shader = cmd_buffer->xclipse_batch_task;
@@ -16081,6 +16113,13 @@ radv_xclipse_task_batch_flush_reason(struct radv_cmd_buffer *cmd_buffer, unsigne
    if (!total)
       return;
 
+   /* RADV_XCLIPSE_MESHBATCH_LOOSE=2 leaves the batch pending across every hook boundary, so one batch
+    * can span queries, barriers, transfers and unrelated draws. Rendering is wrong; the frame time it
+    * produces is the largest merge this frame allows, which is what decides whether the per-draw state
+    * work is worth doing. Tagged boundaries (state, max, ring, end, execute, not-batchable) still emit. */
+   if (_line && xclipse_mesh_batch_loose() >= 2)
+      return;
+
    /* Cleared first: the flushes below come back through radv_emit_cache_flush(), and the mesh draw
     * through the same path a plain draw takes. A pending batch is never dropped, even if the shaders
     * have been rebound since it opened: it is emitted with the metadata it was opened with. */
@@ -16089,7 +16128,7 @@ radv_xclipse_task_batch_flush_reason(struct radv_cmd_buffer *cmd_buffer, unsigne
    cmd_buffer->xclipse_batch_token = 0;
 
    xb_diag.batches++;
-   xb_diag.reasons[reason < ARRAY_SIZE(xb_diag.reasons) ? reason : XCLIPSE_BATCH_REASON_OTHER]++;
+   xclipse_flush_site(_file, _line);
    if (total > xb_diag.maxw)
       xb_diag.maxw = total;
 
@@ -16149,18 +16188,12 @@ radv_xclipse_task_batch_flush_reason(struct radv_cmd_buffer *cmd_buffer, unsigne
 }
 
 void
-radv_xclipse_task_batch_flush(struct radv_cmd_buffer *cmd_buffer)
-{
-   radv_xclipse_task_batch_flush_reason(cmd_buffer, XCLIPSE_BATCH_REASON_OTHER);
-}
-
-void
 radv_xclipse_task_batch_flush_if_state_changed(struct radv_cmd_buffer *cmd_buffer)
 {
    if (!cmd_buffer->xclipse_batch_workgroups)
       return;
    if (!xclipse_mesh_batch_loose() && xclipse_task_state_token(cmd_buffer) != cmd_buffer->xclipse_batch_token)
-      radv_xclipse_task_batch_flush_reason(cmd_buffer, XCLIPSE_BATCH_REASON_STATE);
+      XCLIPSE_BATCH_FLUSH_TAG(cmd_buffer, "state");
 }
 
 static void
@@ -16240,7 +16273,7 @@ radv_xclipse_emit_task_draw(struct radv_cmd_buffer *cmd_buffer, const struct rad
    }
 
    if (!batchable) {
-      radv_xclipse_task_batch_flush_reason(cmd_buffer, XCLIPSE_BATCH_REASON_OTHER);
+      XCLIPSE_BATCH_FLUSH_TAG(cmd_buffer, "not-batchable");
       radv_xclipse_emit_task_state(cmd_buffer);
    }
 
@@ -16250,11 +16283,11 @@ radv_xclipse_emit_task_draw(struct radv_cmd_buffer *cmd_buffer, const struct rad
       const bool loose = xclipse_mesh_batch_loose() != 0;
 
       if (!loose && cmd_buffer->xclipse_batch_workgroups && token != cmd_buffer->xclipse_batch_token)
-         radv_xclipse_task_batch_flush_reason(cmd_buffer, XCLIPSE_BATCH_REASON_STATE);
+         XCLIPSE_BATCH_FLUSH_TAG(cmd_buffer, "state");
       if (cmd_buffer->xclipse_batch_workgroups && cmd_buffer->xclipse_batch_draws >= (uint32_t)batch_max)
-         radv_xclipse_task_batch_flush_reason(cmd_buffer, XCLIPSE_BATCH_REASON_MAX);
+         XCLIPSE_BATCH_FLUSH_TAG(cmd_buffer, "max");
       if (cmd_buffer->xclipse_batch_workgroups && cmd_buffer->xclipse_batch_workgroups + x > max_entries)
-         radv_xclipse_task_batch_flush_reason(cmd_buffer, XCLIPSE_BATCH_REASON_RING);
+         XCLIPSE_BATCH_FLUSH_TAG(cmd_buffer, "ring");
 
       if (!cmd_buffer->xclipse_batch_workgroups) {
          radv_xclipse_emit_task_state(cmd_buffer);
@@ -16272,7 +16305,7 @@ radv_xclipse_emit_task_draw(struct radv_cmd_buffer *cmd_buffer, const struct rad
                                             x, 0, task_shader, cmd_buffer->state.shaders[MESA_SHADER_MESH]);
 
       if (cmd_buffer->xclipse_batch_draws >= (uint32_t)batch_max)
-         radv_xclipse_task_batch_flush_reason(cmd_buffer, XCLIPSE_BATCH_REASON_MAX);
+         XCLIPSE_BATCH_FLUSH_TAG(cmd_buffer, "max");
    } else if (info->indirect_va) {
       for (uint32_t i = 0; i < info->count; i++)
          radv_xclipse_emit_task_dispatch_draw(cmd_buffer, grid, 0, 0, info->indirect_va + (uint64_t)i * info->stride, i);
@@ -16661,7 +16694,7 @@ radv_CmdExecuteGeneratedCommandsEXT(VkCommandBuffer commandBuffer, VkBool32 isPr
    VK_FROM_HANDLE(radv_cmd_buffer, cmd_buffer, commandBuffer);
 
    /* keep a pending xclipse task batch on the near side of this boundary */
-   radv_xclipse_task_batch_flush_reason(cmd_buffer, XCLIPSE_BATCH_REASON_DGC);
+   XCLIPSE_BATCH_FLUSH(cmd_buffer);
    const struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
    const struct radv_physical_device *pdev = radv_device_physical(device);
    const bool use_predication = radv_use_dgc_predication(cmd_buffer, pGeneratedCommandsInfo);
@@ -17301,7 +17334,7 @@ radv_CmdDispatchBase(VkCommandBuffer commandBuffer, uint32_t base_x, uint32_t ba
    VK_FROM_HANDLE(radv_cmd_buffer, cmd_buffer, commandBuffer);
    struct radv_dispatch_info info = {0};
 
-   radv_xclipse_task_batch_flush_reason(cmd_buffer, XCLIPSE_BATCH_REASON_DISPATCH);
+   XCLIPSE_BATCH_FLUSH(cmd_buffer);
 
    info.blocks[0] = x;
    info.blocks[1] = y;
@@ -17319,7 +17352,7 @@ radv_CmdDispatchIndirect(VkCommandBuffer commandBuffer, VkBuffer _buffer, VkDevi
    VK_FROM_HANDLE(radv_cmd_buffer, cmd_buffer, commandBuffer);
    VK_FROM_HANDLE(radv_buffer, buffer, _buffer);
 
-   radv_xclipse_task_batch_flush_reason(cmd_buffer, XCLIPSE_BATCH_REASON_DISPATCH);
+   XCLIPSE_BATCH_FLUSH(cmd_buffer);
    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
    struct radv_cmd_stream *cs = cmd_buffer->cs;
 
@@ -18069,7 +18102,7 @@ radv_emit_cache_flush(struct radv_cmd_buffer *cmd_buffer, bool pws_defer_allowed
    /* Every ordering path (draws, dispatches, barriers, EndCommandBuffer, ExecuteCommands) comes
     * through here, so a pending xclipse task batch is emitted before the flush it asked for. The batch
     * clears its counters first, so its own barrier does not recurse. */
-   radv_xclipse_task_batch_flush_reason(cmd_buffer, XCLIPSE_BATCH_REASON_FLUSH);
+   XCLIPSE_BATCH_FLUSH(cmd_buffer);
 
    /* Drain the deferred BCn post-decode flush here only. Every ordering path (draws, dispatches,
     * barriers, EndCommandBuffer, ExecuteCommands) passes through this function, so nothing can
@@ -18327,7 +18360,7 @@ radv_CmdPipelineBarrier2(VkCommandBuffer commandBuffer, const VkDependencyInfo *
    VK_FROM_HANDLE(radv_cmd_buffer, cmd_buffer, commandBuffer);
    enum rgp_barrier_reason barrier_reason;
 
-   radv_xclipse_task_batch_flush_reason(cmd_buffer, XCLIPSE_BATCH_REASON_BARRIER);
+   XCLIPSE_BATCH_FLUSH(cmd_buffer);
 
    if (cmd_buffer->vk.runtime_rp_barrier) {
       barrier_reason = RGP_BARRIER_EXTERNAL_RENDER_PASS_SYNC;
@@ -18564,7 +18597,7 @@ radv_end_conditional_rendering(struct radv_cmd_buffer *cmd_buffer)
 {
    /* A draw recorded under the predicate must not be emitted after predication is
     * disabled. */
-   radv_xclipse_task_batch_flush_reason(cmd_buffer, XCLIPSE_BATCH_REASON_PREDICATE);
+   XCLIPSE_BATCH_FLUSH(cmd_buffer);
 
    struct radv_cond_render_state *cond_render = &cmd_buffer->state.cond_render;
 
