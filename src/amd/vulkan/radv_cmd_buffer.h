@@ -482,6 +482,15 @@ struct radv_cmd_buffer_queue_state {
    bool uses_perf_counters;
 };
 
+/* RADV_XCLIPSE_PACKET_CENSUS=1: what a recording emitted, counted at the emit sites so hardware packets
+ * are never confused with the logical draws the application asked for. */
+struct xclipse_packet_census {
+   uint32_t task_draws, path_direct, indirect_apps, indirect_subs, path_multidim, path_oversize, batched;
+   uint32_t dispatch_direct, dispatch_indirect, dispatch_batch, mesh_packets;
+   uint32_t batches, merged_draws, max_merge;
+   uint64_t begin_ns;
+};
+
 struct radv_cmd_buffer {
    struct vk_command_buffer vk;
 
@@ -610,6 +619,10 @@ struct radv_cmd_buffer {
    uint32_t xclipse_batch_initiator;
    uint64_t xclipse_batch_draw_ring_va;
 
+   /* RADV_XCLIPSE_PACKET_CENSUS=1: what this recording emitted, counted at the emit sites so hardware
+    * packets are never confused with the logical draws the application asked for. */
+   struct xclipse_packet_census xc_census;
+
 };
 
 struct radv_msrtss_transient {
@@ -634,10 +647,13 @@ void radv_xclipse_task_batch_flush_if_state_changed(struct radv_cmd_buffer *cmd_
 
 /* Same, recording which call site asked for it. Every flush goes through the macro below, so the
  * diagnostic histogram names the boundary itself rather than a guess at its category. */
-void radv_xclipse_task_batch_flush_at(struct radv_cmd_buffer *cmd_buffer, const char *file, int line);
+void radv_xclipse_task_batch_flush_at(struct radv_cmd_buffer *cmd_buffer, const char *file, int line,
+                                      const char *why);
 
-#define XCLIPSE_BATCH_FLUSH(cmd_buffer) radv_xclipse_task_batch_flush_at(cmd_buffer, __FILE__, __LINE__)
-#define XCLIPSE_BATCH_FLUSH_TAG(cmd_buffer, tag) radv_xclipse_task_batch_flush_at(cmd_buffer, (tag), 0)
+#define XCLIPSE_BATCH_FLUSH(cmd_buffer) radv_xclipse_task_batch_flush_at(cmd_buffer, __FILE__, __LINE__, NULL)
+#define XCLIPSE_BATCH_FLUSH_TAG(cmd_buffer, tag) radv_xclipse_task_batch_flush_at(cmd_buffer, (tag), 0, NULL)
+/* Same, with the reason spelled out where the call site cannot (an occlusion query is not a file name). */
+#define XCLIPSE_BATCH_FLUSH_WHY(cmd_buffer, why) radv_xclipse_task_batch_flush_at(cmd_buffer, __FILE__, __LINE__, (why))
 
 static inline struct radv_device *
 radv_cmd_buffer_device(const struct radv_cmd_buffer *cmd_buffer)

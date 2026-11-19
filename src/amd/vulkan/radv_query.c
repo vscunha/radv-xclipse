@@ -2603,16 +2603,39 @@ emit_end_query(struct radv_cmd_buffer *cmd_buffer, struct radv_query_pool *pool,
       get_query_flush_bits(radv_device_physical(radv_cmd_buffer_device(cmd_buffer)), query_type);
 }
 
+/* The query type, so the batch diagnostic says which kind of query closed a batch instead of only
+ * which source line did. */
+static const char *
+xclipse_query_kind(VkQueryType type)
+{
+   switch (type) {
+   case VK_QUERY_TYPE_OCCLUSION:
+      return "occlusion";
+   case VK_QUERY_TYPE_PIPELINE_STATISTICS:
+      return "pipeline_stats";
+   case VK_QUERY_TYPE_TIMESTAMP:
+      return "timestamp";
+   case VK_QUERY_TYPE_MESH_PRIMITIVES_GENERATED_EXT:
+      return "mesh_primitives";
+   case VK_QUERY_TYPE_PRIMITIVES_GENERATED_EXT:
+      return "primitives_generated";
+   case VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT:
+      return "transform_feedback";
+   default:
+      return "other";
+   }
+}
+
 VKAPI_ATTR void VKAPI_CALL
 radv_CmdBeginQueryIndexedEXT(VkCommandBuffer commandBuffer, VkQueryPool queryPool, uint32_t query,
                              VkQueryControlFlags flags, uint32_t index)
 {
    VK_FROM_HANDLE(radv_cmd_buffer, cmd_buffer, commandBuffer);
 
+   VK_FROM_HANDLE(radv_query_pool, pool, queryPool);
    /* A pending xclipse task batch must not move across a query boundary: its snapshot
     * would miss the draw that was recorded before it. */
-   XCLIPSE_BATCH_FLUSH(cmd_buffer);
-   VK_FROM_HANDLE(radv_query_pool, pool, queryPool);
+   XCLIPSE_BATCH_FLUSH_WHY(cmd_buffer, xclipse_query_kind(pool->vk.query_type));
    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
    struct radv_cmd_stream *cs = cmd_buffer->cs;
    uint64_t va = radv_buffer_get_va(pool->bo);
@@ -2642,10 +2665,10 @@ radv_CmdEndQueryIndexedEXT(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
 {
    VK_FROM_HANDLE(radv_cmd_buffer, cmd_buffer, commandBuffer);
 
+   VK_FROM_HANDLE(radv_query_pool, pool, queryPool);
    /* A pending xclipse task batch must not move across a query boundary: its snapshot
     * would miss the draw that was recorded before it. */
-   XCLIPSE_BATCH_FLUSH(cmd_buffer);
-   VK_FROM_HANDLE(radv_query_pool, pool, queryPool);
+   XCLIPSE_BATCH_FLUSH_WHY(cmd_buffer, xclipse_query_kind(pool->vk.query_type));
    uint64_t va = radv_buffer_get_va(pool->bo);
    uint64_t avail_va = va + pool->availability_offset + 4 * query;
    va += pool->stride * query;

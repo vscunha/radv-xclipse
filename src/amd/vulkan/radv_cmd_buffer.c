@@ -14,6 +14,8 @@
 #include "radv_logcat.h"
 #include "ac_xclipse_log.h"
 #include "vk_enum_to_str.h"
+#include "util/os_time.h"
+
 #include "tools/radv_debug_hang.h"
 #include "tools/radv_rmv.h"
 #include "tools/radv_rra.h"
@@ -8635,6 +8637,122 @@ radv_init_default_state(struct radv_cmd_buffer *cmd_buffer)
    }
 }
 
+/* RADV_XCLIPSE_PACKET_CENSUS=1 counts the hardware packets this emulation emits, per command buffer, so a
+ * device log says how many DISPATCH_DIRECT / DISPATCH_INDIRECT / DRAW_INDIRECT_MULTI packets one frame really
+ * contains instead of how many logical draws the application asked for. Off by default: when it is off every
+ * counter below is one predicted branch, and no packet, register or barrier changes. */
+enum xclipse_packet_kind {
+   XC_PKT_TASK_DISPATCH_DIRECT = 0, /* PKT3_DISPATCH_DIRECT of the per-draw task path */
+   XC_PKT_TASK_DISPATCH_INDIRECT,   /* PKT3_DISPATCH_INDIRECT (grid read from memory) */
+   XC_PKT_TASK_DISPATCH_BATCH,      /* PKT3_DISPATCH_DIRECT emitted by a merged batch */
+   XC_PKT_MESH_DRAW,                /* PKT3_DRAW_INDIRECT_MULTI that draws the mesh shaders */
+};
+
+static int
+xclipse_packet_census(void)
+{
+   static _Thread_local int state = -1;
+   if (state < 0) {
+      const char *e = getenv("RADV_XCLIPSE_PACKET_CENSUS");
+      state = e && *e ? atoi(e) : 0;
+      if (state)
+         fprintf(stderr, "radv: xclipse: packet census %d: count emitted packets per command buffer\n", state);
+   }
+   return state;
+}
+
+static void
+xclipse_census_packet(struct radv_cmd_buffer *cmd_buffer, enum xclipse_packet_kind kind, uint32_t n)
+{
+   if (!xclipse_packet_census())
+      return;
+
+   switch (kind) {
+   case XC_PKT_TASK_DISPATCH_DIRECT:
+      cmd_buffer->xc_census.dispatch_direct += n;
+      break;
+   case XC_PKT_TASK_DISPATCH_INDIRECT:
+      cmd_buffer->xc_census.dispatch_indirect += n;
+      break;
+   case XC_PKT_TASK_DISPATCH_BATCH:
+      cmd_buffer->xc_census.dispatch_batch += n;
+      break;
+   case XC_PKT_MESH_DRAW:
+      cmd_buffer->xc_census.mesh_packets += n;
+      break;
+   }
+}
+
+/* Why a task draw could not use the merged path, and what it cost instead. */
+enum xclipse_draw_path {
+   XC_PATH_DIRECT_1D = 0,
+   XC_PATH_INDIRECT,
+   XC_PATH_MULTIDIM,
+   XC_PATH_OVERSIZE,
+   XC_PATH_BATCH,
+};
+
+static void
+xclipse_census_draw(struct radv_cmd_buffer *cmd_buffer, enum xclipse_draw_path path, uint32_t subs)
+{
+   if (!xclipse_packet_census())
+      return;
+
+   cmd_buffer->xc_census.task_draws++;
+   switch (path) {
+   case XC_PATH_DIRECT_1D:
+      cmd_buffer->xc_census.path_direct++;
+      break;
+   case XC_PATH_INDIRECT:
+      cmd_buffer->xc_census.indirect_apps++;
+      cmd_buffer->xc_census.indirect_subs += subs;
+      break;
+   case XC_PATH_MULTIDIM:
+      cmd_buffer->xc_census.path_multidim++;
+      break;
+   case XC_PATH_OVERSIZE:
+      cmd_buffer->xc_census.path_oversize++;
+      break;
+   case XC_PATH_BATCH:
+      cmd_buffer->xc_census.batched++;
+      break;
+   }
+}
+
+static void
+xclipse_census_merge(struct radv_cmd_buffer *cmd_buffer, uint32_t draws)
+{
+   if (!xclipse_packet_census())
+      return;
+
+   cmd_buffer->xc_census.batches++;
+   cmd_buffer->xc_census.merged_draws += draws;
+   if (draws > cmd_buffer->xc_census.max_merge)
+      cmd_buffer->xc_census.max_merge = draws;
+}
+
+/* One line per command buffer, printed where the recording ends so it lands next to the submission the
+ * emulator logs for the same frame. */
+static void
+xclipse_census_report(struct radv_cmd_buffer *cmd_buffer)
+{
+   const struct xclipse_packet_census *c = &cmd_buffer->xc_census;
+   const uint32_t dispatch_packets = c->dispatch_direct + c->dispatch_indirect + c->dispatch_batch;
+
+   if (!xclipse_packet_census() || (!c->task_draws && !dispatch_packets))
+      return;
+
+   const double rec_ms = c->begin_ns ? (double)(os_time_get_nano() - c->begin_ns) / 1e6 : 0.0;
+
+   fprintf(stderr,
+           "radv: xclipse: census rec=%.2fms task_draws=%u (direct %u, indirect %u x sub %u, multidim %u, "
+           "oversize %u, batched %u) dispatch_pkts=%u (direct %u, indirect %u, batch %u) mesh_pkts=%u "
+           "batches=%u merged=%u max_merged=%u\n",
+           rec_ms, c->task_draws, c->path_direct, c->indirect_apps, c->indirect_subs, c->path_multidim,
+           c->path_oversize, c->batched, dispatch_packets, c->dispatch_direct, c->dispatch_indirect,
+           c->dispatch_batch, c->mesh_packets, c->batches, c->merged_draws, c->max_merge);
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 radv_BeginCommandBuffer(VkCommandBuffer commandBuffer, const VkCommandBufferBeginInfo *pBeginInfo)
 {
@@ -8642,6 +8760,8 @@ radv_BeginCommandBuffer(VkCommandBuffer commandBuffer, const VkCommandBufferBegi
 
    /* A recording that is thrown away must not carry a pending task batch into the next one.
     * Discarded, not flushed: the packets of an abandoned recording are never submitted. */
+   memset(&cmd_buffer->xc_census, 0, sizeof(cmd_buffer->xc_census));
+   cmd_buffer->xc_census.begin_ns = xclipse_packet_census() ? os_time_get_nano() : 0;
    cmd_buffer->xclipse_batch_workgroups = 0;
    cmd_buffer->xclipse_batch_draws = 0;
    cmd_buffer->xclipse_batch_token = 0;
@@ -9367,6 +9487,7 @@ radv_EndCommandBuffer(VkCommandBuffer commandBuffer)
    VK_FROM_HANDLE(radv_cmd_buffer, cmd_buffer, commandBuffer);
 
    XCLIPSE_BATCH_FLUSH_TAG(cmd_buffer, "end");
+   xclipse_census_report(cmd_buffer);
    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
    ASSERTED const struct radv_physical_device *pdev = radv_device_physical(device);
    struct radv_cmd_stream *cs = cmd_buffer->cs;
@@ -15609,6 +15730,7 @@ radv_xclipse_emit_mesh_draw_indirect(struct radv_cmd_buffer *cmd_buffer, uint64_
       radeon_end();
    }
 
+   xclipse_census_packet(cmd_buffer, XC_PKT_MESH_DRAW, num_views);
    cmd_buffer->state.uses_draw_indirect = true;
 }
 
@@ -15873,6 +15995,7 @@ radv_xclipse_emit_task_dispatch_draw(struct radv_cmd_buffer *cmd_buffer, const u
       radeon_emit(0);
       radeon_emit(initiator | S_00B800_FORCE_START_AT_000(1));
       radeon_end();
+      xclipse_census_packet(cmd_buffer, XC_PKT_TASK_DISPATCH_INDIRECT, 1);
    } else if (!(bisect & 1)) {
       const uint32_t g0 = tiny ? 1 : grid[0], g1 = tiny ? 1 : grid[1], g2 = tiny ? 1 : grid[2];
       const uint32_t start = tiny ? 0 : first;
@@ -15900,6 +16023,7 @@ radv_xclipse_emit_task_dispatch_draw(struct radv_cmd_buffer *cmd_buffer, const u
       radeon_emit(g2);
       radeon_emit(initiator);
       radeon_end();
+      xclipse_census_packet(cmd_buffer, XC_PKT_TASK_DISPATCH_DIRECT, 1);
    }
 
    /* The CP reads the draw ring and the mesh shaders read the payload. Radv asks for INV_L2 | WB_L2 here
@@ -15985,8 +16109,11 @@ xclipse_task_state_token(struct radv_cmd_buffer *cmd_buffer)
 
 struct xclipse_flush_site {
    const char *file; /* basename, or a tag such as "state" for the accumulator's own boundaries */
+   const char *why;  /* optional refinement: the query type, for instance */
    int line;
    uint32_t count;
+   uint32_t cut_sum; /* logical draws the batches closed here contained, in total */
+   uint32_t cut_max;
 };
 
 static _Thread_local struct {
@@ -16076,28 +16203,33 @@ xclipse_batch_stats(char *out, size_t out_size, struct radv_cmd_buffer *cmd_buff
       const struct xclipse_flush_site *site = &xb_diag.sites[i];
       const char *slash = site->file ? strrchr(site->file, '/') : NULL;
       if (site->line)
-         pos += snprintf(out + pos, out_size - pos, " %s:%d %u", slash ? slash + 1 : site->file, site->line,
-                         site->count);
+         pos += snprintf(out + pos, out_size - pos, " %s:%d%s%s %u (cut avg %.2f max %u)",
+                         slash ? slash + 1 : site->file, site->line, site->why ? "[" : "",
+                         site->why ? site->why : "", site->count,
+                         site->count ? (double)site->cut_sum / (double)site->count : 0.0, site->cut_max);
       else
-         pos += snprintf(out + pos, out_size - pos, " %s %u", site->file, site->count);
+         pos += snprintf(out + pos, out_size - pos, " %s %u (cut avg %.2f max %u)", site->file, site->count,
+                         site->count ? (double)site->cut_sum / (double)site->count : 0.0, site->cut_max);
    }
    snprintf(out + pos, out_size - pos, "\n");
 }
 
 static void
-xclipse_flush_site(const char *file, int line)
+xclipse_flush_site(const char *file, int line, const char *why, uint32_t cut)
 {
    for (uint32_t i = 0; i < xb_diag.n_sites; i++) {
-      if (xb_diag.sites[i].file == file && xb_diag.sites[i].line == line) {
+      if (xb_diag.sites[i].file == file && xb_diag.sites[i].line == line && xb_diag.sites[i].why == why) {
          xb_diag.sites[i].count++;
+         xb_diag.sites[i].cut_sum += cut;
+         if (cut > xb_diag.sites[i].cut_max)
+            xb_diag.sites[i].cut_max = cut;
          return;
       }
    }
    if (xb_diag.n_sites < XCLIPSE_MAX_FLUSH_SITES) {
-      xb_diag.sites[xb_diag.n_sites].file = file;
-      xb_diag.sites[xb_diag.n_sites].line = line;
-      xb_diag.sites[xb_diag.n_sites].count = 1;
-      xb_diag.n_sites++;
+      struct xclipse_flush_site *site = &xb_diag.sites[xb_diag.n_sites++];
+      *site = (struct xclipse_flush_site){.file = file, .why = why, .line = line, .count = 1, .cut_sum = cut,
+                                          .cut_max = cut};
    }
 }
 
@@ -16109,6 +16241,7 @@ radv_xclipse_task_batch_flush_at(struct radv_cmd_buffer *cmd_buffer, const char 
    const struct radv_shader *mesh_shader = cmd_buffer->xclipse_batch_mesh;
    struct radv_cmd_stream *cs = cmd_buffer->cs;
    const uint32_t total = cmd_buffer->xclipse_batch_workgroups;
+   const uint32_t draws = cmd_buffer->xclipse_batch_draws;
 
    if (!total)
       return;
@@ -16128,7 +16261,9 @@ radv_xclipse_task_batch_flush_at(struct radv_cmd_buffer *cmd_buffer, const char 
    cmd_buffer->xclipse_batch_token = 0;
 
    xb_diag.batches++;
-   xclipse_flush_site(_file, _line);
+   xclipse_flush_site(_file, _line, _why, draws);
+   xclipse_census_merge(cmd_buffer, draws);
+   xclipse_census_packet(cmd_buffer, XC_PKT_TASK_DISPATCH_BATCH, 1);
    if (total > xb_diag.maxw)
       xb_diag.maxw = total;
 
@@ -16234,6 +16369,20 @@ radv_xclipse_emit_task_draw(struct radv_cmd_buffer *cmd_buffer, const struct rad
    const uint32_t task_draw_id_loc = task_shader ? radv_get_user_sgpr_loc(task_shader, AC_UD_CS_TASK_DRAW_ID) : 0;
    const bool batchable = batch_max > 1 && !info->indirect_va && y == 1 && z == 1 && x > 0 &&
                           x <= max_entries && !cmd_buffer->state.uses_drawid && task_shader && task_draw_id_loc == 0;
+
+   /* Which path this logical draw takes, counted where the decision is made. */
+   if (xclipse_packet_census()) {
+      if (batchable)
+         xclipse_census_draw(cmd_buffer, XC_PATH_BATCH, 1);
+      else if (info->indirect_va)
+         xclipse_census_draw(cmd_buffer, XC_PATH_INDIRECT, info->count);
+      else if (y != 1 || z != 1)
+         xclipse_census_draw(cmd_buffer, XC_PATH_MULTIDIM, 1);
+      else if (x > max_entries)
+         xclipse_census_draw(cmd_buffer, XC_PATH_OVERSIZE, 1);
+      else
+         xclipse_census_draw(cmd_buffer, XC_PATH_DIRECT_1D, 1);
+   }
 
    /* Counted per task draw, so one run says which condition rejects them. Only while the knob is on:
     * at 0 and 1 this path is left exactly as it was, which is what a control run needs. */
