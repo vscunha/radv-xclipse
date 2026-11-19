@@ -14,7 +14,6 @@
 #include "radv_logcat.h"
 #include "ac_xclipse_log.h"
 #include "vk_enum_to_str.h"
-#include "util/os_time.h"
 
 #include "tools/radv_debug_hang.h"
 #include "tools/radv_rmv.h"
@@ -8689,6 +8688,7 @@ enum xclipse_draw_path {
    XC_PATH_INDIRECT,
    XC_PATH_MULTIDIM,
    XC_PATH_OVERSIZE,
+   XC_PATH_EMPTY, /* no packet was emitted: an empty grid, or a measurement knob skipped it */
    XC_PATH_BATCH,
 };
 
@@ -8712,6 +8712,9 @@ xclipse_census_draw(struct radv_cmd_buffer *cmd_buffer, enum xclipse_draw_path p
       break;
    case XC_PATH_OVERSIZE:
       cmd_buffer->xc_census.path_oversize++;
+      break;
+   case XC_PATH_EMPTY:
+      cmd_buffer->xc_census.path_empty++;
       break;
    case XC_PATH_BATCH:
       cmd_buffer->xc_census.batched++;
@@ -8739,17 +8742,17 @@ xclipse_census_report(struct radv_cmd_buffer *cmd_buffer)
    const struct xclipse_packet_census *c = &cmd_buffer->xc_census;
    const uint32_t dispatch_packets = c->dispatch_direct + c->dispatch_indirect + c->dispatch_batch;
 
-   if (!xclipse_packet_census() || (!c->task_draws && !dispatch_packets))
+   if (!xclipse_packet_census() || (!c->task_draws && !dispatch_packets && !c->mesh_packets))
       return;
 
-   const double rec_ms = c->begin_ns ? (double)(os_time_get_nano() - c->begin_ns) / 1e6 : 0.0;
+   const double rec_ms = c->begin_ns ? (double)(os_time_get_nano() - (int64_t)c->begin_ns) / 1e6 : 0.0;
 
    fprintf(stderr,
            "radv: xclipse: census rec=%.2fms task_draws=%u (direct %u, indirect %u x sub %u, multidim %u, "
-           "oversize %u, batched %u) dispatch_pkts=%u (direct %u, indirect %u, batch %u) mesh_pkts=%u "
+           "oversize %u, empty %u, batched %u) dispatch_pkts=%u (direct %u, indirect %u, batch %u) mesh_pkts=%u "
            "batches=%u merged=%u max_merged=%u\n",
            rec_ms, c->task_draws, c->path_direct, c->indirect_apps, c->indirect_subs, c->path_multidim,
-           c->path_oversize, c->batched, dispatch_packets, c->dispatch_direct, c->dispatch_indirect,
+           c->path_oversize, c->path_empty, c->batched, dispatch_packets, c->dispatch_direct, c->dispatch_indirect,
            c->dispatch_batch, c->mesh_packets, c->batches, c->merged_draws, c->max_merge);
 }
 
@@ -8760,13 +8763,13 @@ radv_BeginCommandBuffer(VkCommandBuffer commandBuffer, const VkCommandBufferBegi
 
    /* A recording that is thrown away must not carry a pending task batch into the next one.
     * Discarded, not flushed: the packets of an abandoned recording are never submitted. */
-   memset(&cmd_buffer->xc_census, 0, sizeof(cmd_buffer->xc_census));
-   cmd_buffer->xc_census.begin_ns = xclipse_packet_census() ? os_time_get_nano() : 0;
    cmd_buffer->xclipse_batch_workgroups = 0;
    cmd_buffer->xclipse_batch_draws = 0;
    cmd_buffer->xclipse_batch_token = 0;
    cmd_buffer->xclipse_batch_task = NULL;
    cmd_buffer->xclipse_batch_mesh = NULL;
+   memset(&cmd_buffer->xc_census, 0, sizeof(cmd_buffer->xc_census));
+   cmd_buffer->xc_census.begin_ns = xclipse_packet_census() ? os_time_get_nano() : 0;
    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
    const struct radv_physical_device *pdev = radv_device_physical(device);
    VkResult result = VK_SUCCESS;
@@ -16160,6 +16163,26 @@ xclipse_mesh_batch_loose(void)
    return v;
 }
 
+/* RADV_XCLIPSE_SPLIT=n (diagnostic, read per draw, live): emit each direct 1-D task draw as dispatches of
+ * at most n workgroups instead of one dispatch, i.e. the same total workgroups and the same ring records
+ * spread over more packets. It is the same transformation the driver already applies to grids larger than
+ * the ring, so it changes the packet count and nothing else - which is what separates a fixed cost per
+ * packet from the cost of the work itself. 0 or unset keeps one dispatch per draw. */
+static uint32_t
+xclipse_split_packets(uint32_t max_entries)
+{
+   const char *e = getenv("RADV_XCLIPSE_SPLIT");
+   const uint32_t v = e && *e ? (uint32_t)strtoul(e, NULL, 10) : 0;
+   static _Thread_local uint32_t last = UINT32_MAX;
+   if (v != last) {
+      last = v;
+      fprintf(stderr, "radv: xclipse: split %u: %s\n", v,
+              v ? "each task draw is emitted as dispatches of at most this many workgroups"
+                : "one dispatch per task draw");
+   }
+   return v ? MIN2(v, max_entries) : max_entries;
+}
+
 /* Everything the flush needs, taken when the batch opens: the deferred dispatch and draw must not be
  * programmed with whatever pipeline happens to be bound when the batch is finally emitted. */
 static void
@@ -16234,7 +16257,7 @@ xclipse_flush_site(const char *file, int line, const char *why, uint32_t cut)
 }
 
 void
-radv_xclipse_task_batch_flush_at(struct radv_cmd_buffer *cmd_buffer, const char *_file, int _line)
+radv_xclipse_task_batch_flush_at(struct radv_cmd_buffer *cmd_buffer, const char *_file, int _line, const char *_why)
 {
    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
    const struct radv_shader *task_shader = cmd_buffer->xclipse_batch_task;
@@ -16260,21 +16283,22 @@ radv_xclipse_task_batch_flush_at(struct radv_cmd_buffer *cmd_buffer, const char 
    cmd_buffer->xclipse_batch_draws = 0;
    cmd_buffer->xclipse_batch_token = 0;
 
-   xb_diag.batches++;
-   xclipse_flush_site(_file, _line, _why, draws);
-   xclipse_census_merge(cmd_buffer, draws);
-   xclipse_census_packet(cmd_buffer, XC_PKT_TASK_DISPATCH_BATCH, 1);
-   if (total > xb_diag.maxw)
-      xb_diag.maxw = total;
-
    const uint32_t grid_loc = cmd_buffer->xclipse_batch_grid_loc;
    const uint32_t draw_id_loc = cmd_buffer->xclipse_batch_draw_id_loc;
    const uint32_t ring_entry_loc = cmd_buffer->xclipse_batch_ring_entry_loc;
    const uint64_t draw_ring_va = cmd_buffer->xclipse_batch_draw_ring_va;
    uint32_t initiator = cmd_buffer->xclipse_batch_initiator;
 
+   /* Nothing is emitted without the captured shaders and ring, so nothing is counted either. */
    if (!task_shader || !mesh_shader || !draw_ring_va)
       return;
+
+   xb_diag.batches++;
+   xclipse_flush_site(_file, _line, _why, draws);
+   xclipse_census_merge(cmd_buffer, draws);
+   xclipse_census_packet(cmd_buffer, XC_PKT_TASK_DISPATCH_BATCH, 1);
+   if (total > xb_diag.maxw)
+      xb_diag.maxw = total;
 
    /* Mesh shaders of the previous batch may still read the payload ring, and the ring of this batch
     * starts at entry zero again. Same protection the unbatched path emits before its dispatch. */
@@ -16378,6 +16402,8 @@ radv_xclipse_emit_task_draw(struct radv_cmd_buffer *cmd_buffer, const struct rad
          xclipse_census_draw(cmd_buffer, XC_PATH_INDIRECT, info->count);
       else if (y != 1 || z != 1)
          xclipse_census_draw(cmd_buffer, XC_PATH_MULTIDIM, 1);
+      else if (!x)
+         xclipse_census_draw(cmd_buffer, XC_PATH_EMPTY, 1);
       else if (x > max_entries)
          xclipse_census_draw(cmd_buffer, XC_PATH_OVERSIZE, 1);
       else
@@ -16415,7 +16441,7 @@ radv_xclipse_emit_task_draw(struct radv_cmd_buffer *cmd_buffer, const struct rad
    /* Every 256 batched-path draws, and at most 64 lines: the scene can hang, and the last line before
     * it is the reading, so the report must not wait for a quiet moment that never comes. */
    if (batch_max > 1 && xb_diag.seen >= xb_diag.next_report && xb_diag.next_report < 64 * 256) {
-      char line[640];
+      char line[2048];
       xb_diag.next_report += 256;
       xclipse_batch_stats(line, sizeof(line), cmd_buffer);
       fputs(line, stderr);
@@ -16459,9 +16485,12 @@ radv_xclipse_emit_task_draw(struct radv_cmd_buffer *cmd_buffer, const struct rad
       for (uint32_t i = 0; i < info->count; i++)
          radv_xclipse_emit_task_dispatch_draw(cmd_buffer, grid, 0, 0, info->indirect_va + (uint64_t)i * info->stride, i);
    } else if (y == 1 && z == 1) {
-      /* More workgroups than ring entries: several passes along x. */
-      for (uint32_t first = 0; first < x; first += max_entries)
-         radv_xclipse_emit_task_dispatch_draw(cmd_buffer, grid, first, MIN2(x - first, max_entries), 0, 0);
+      /* More workgroups than ring entries: several passes along x. RADV_XCLIPSE_SPLIT shrinks the step
+       * further, at the same total workgroups, to measure what a packet costs. */
+      const uint32_t step = xclipse_split_packets(max_entries);
+      for (uint32_t first = 0; first < x; first += step)
+         radv_xclipse_emit_task_dispatch_draw(cmd_buffer, grid, first, MIN2(x - first, step), 0,
+                                          0);
    } else {
       radv_xclipse_emit_task_dispatch_draw(cmd_buffer, grid, 0, MIN2(x * y * z, max_entries), 0, 0);
    }

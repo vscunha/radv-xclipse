@@ -485,7 +485,8 @@ struct radv_cmd_buffer_queue_state {
 /* RADV_XCLIPSE_PACKET_CENSUS=1: what a recording emitted, counted at the emit sites so hardware packets
  * are never confused with the logical draws the application asked for. */
 struct xclipse_packet_census {
-   uint32_t task_draws, path_direct, indirect_apps, indirect_subs, path_multidim, path_oversize, batched;
+   uint32_t task_draws, path_direct, indirect_apps, indirect_subs, path_multidim, path_oversize, path_empty;
+   uint32_t batched;
    uint32_t dispatch_direct, dispatch_indirect, dispatch_batch, mesh_packets;
    uint32_t batches, merged_draws, max_merge;
    uint64_t begin_ns;
@@ -622,7 +623,6 @@ struct radv_cmd_buffer {
    /* RADV_XCLIPSE_PACKET_CENSUS=1: what this recording emitted, counted at the emit sites so hardware
     * packets are never confused with the logical draws the application asked for. */
    struct xclipse_packet_census xc_census;
-
 };
 
 struct radv_msrtss_transient {
