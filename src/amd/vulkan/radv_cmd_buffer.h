@@ -485,8 +485,16 @@ struct radv_cmd_buffer_queue_state {
 /* RADV_XCLIPSE_PACKET_CENSUS=1: what a recording emitted, counted at the emit sites so hardware packets
  * are never confused with the logical draws the application asked for. */
 struct xclipse_packet_census {
-   uint32_t general_draws;   /* every ordinary graphics draw recorded */
+   uint32_t general_draws;   /* every ordinary graphics draw *call* recorded (a multi-draw is one call) */
    uint32_t taskmesh_draws;  /* every draw that entered the task/mesh emulation */
+   /* Recording, not execution: these count what was put in the stream. A buffer recorded once and
+    * submitted twice contributes once here and twice to the submit-side counters. */
+   uint32_t multi_draws;     /* calls carrying more than one draw (drawCount > 1 or an indirect count>1) */
+   uint32_t multi_instances; /* sum of those counts: the GPU may run this many draws from one packet */
+   uint32_t empty_draws;     /* calls with zero instances/count: recorded, emit nothing */
+   uint32_t dispatch_calls;  /* vkCmdDispatch* calls (the task emulation's dispatches are counted as packets) */
+   uint32_t secondary;       /* the command buffer is secondary: its numbers are counted again by the parent's execution */
+   uint32_t executions;      /* secondary: times its stream was executed from a parent. primary: child streams folded in */
    uint32_t task_draws, path_direct, indirect_apps, indirect_subs, path_multidim, path_oversize, path_empty;
    uint32_t batched;
    uint32_t dispatch_direct, dispatch_indirect, dispatch_batch, mesh_packets;

@@ -9,6 +9,8 @@
  */
 
 #include "radv_queue.h"
+
+#include "radv_xclipse_native_trace.h"
 #include "radv_cpushare.h"
 #include "tools/radv_debug_hang.h"
 #include "tools/radv_debug_nir.h"
@@ -2102,6 +2104,26 @@ radv_queue_submit(struct vk_queue *vqueue, struct vk_queue_submit *submission)
    if (xprof_t0)
       u_xclipse_prof_wait(U_XCLIPSE_WAIT_SUBMIT, os_time_get_nano() - xprof_t0);
    RADV_CPU_T1(RADV_CPU_SUBMIT);
+
+   /* Submit-side accounting (off by default): what is being handed to the hardware now, and when each
+    * signalled sync was, so a later fence wait can say how old the submission it blocks on is. */
+   if (r == VK_SUCCESS && radv_xclipse_submit_diag()) {
+      uint32_t draws = 0, taskmesh = 0, task = 0, exec = 0, dispatch = 0, mesh = 0;
+      for (uint32_t i = 0; i < submission->command_buffer_count; i++) {
+         const struct radv_cmd_buffer *cb = (const struct radv_cmd_buffer *)submission->command_buffers[i];
+         draws += cb->xc_census.general_draws;
+         taskmesh += cb->xc_census.taskmesh_draws;
+         task += cb->xc_census.task_draws;
+         exec += cb->xc_census.executions;
+         dispatch += cb->xc_census.dispatch_direct + cb->xc_census.dispatch_indirect + cb->xc_census.dispatch_batch;
+         mesh += cb->xc_census.mesh_packets;
+      }
+      for (uint32_t i = 0; i < submission->signal_count; i++)
+         radv_xclipse_diag_note_signal(submission->signals[i].sync);
+      radv_xclipse_diag_submit(radv_queue_ring((struct radv_queue *)vqueue), submission->command_buffer_count, draws,
+                               taskmesh, task, exec, dispatch, mesh, submission->wait_count,
+                               submission->signal_count);
+   }
    return r;
 }
 

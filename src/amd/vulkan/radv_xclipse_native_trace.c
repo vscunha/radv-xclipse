@@ -10,6 +10,7 @@
 #include "radv_xclipse_native_trace.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 
 #include "util/os_time.h"
 #include "util/simple_mtx.h"
@@ -290,9 +291,102 @@ radv_xclipse_native_trace_present(struct radv_device *device)
                              snapshot.submit_user_fence, snapshot.submit_result);
 }
 
-void
-radv_xclipse_native_trace_fence_wait(uint32_t fence_count, uint32_t wait_all, int result, uint64_t wait_ns)
+/* ---- submit-side accounting ---------------------------------------------------------------- */
+
+#define XD_SYNC_RING 64
+
+struct xd_sync {
+   const void *sync;
+   uint64_t submitted_ns;
+   uint64_t seq;
+};
+
+static struct xd_sync xd_ring[XD_SYNC_RING];
+static uint64_t xd_seq;
+static uint64_t xd_last_submit_ns;
+static uint32_t xd_submit_n;
+static uint32_t xd_reports;
+
+bool
+radv_xclipse_submit_diag(void)
 {
+   static int cached = -1;
+   if (cached < 0) {
+      const char *e = getenv("RADV_XCLIPSE_SUBMIT_DIAG");
+      cached = e && *e ? atoi(e) : 0;
+      if (cached)
+         fprintf(stderr, "radv: xclipse: submit diag %d: one line a vkQueueSubmit and the age of every fence "
+                         "wait over 100 ms\n", cached);
+   }
+   return cached != 0;
+}
+
+/* A sync signalled by a submission; the ring is small because only the last few submissions can still
+ * be waited on (the app's slots are reused in order). */
+void
+radv_xclipse_diag_note_signal(const void *sync)
+{
+   if (!sync || !radv_xclipse_submit_diag())
+      return;
+   struct xd_sync *e = &xd_ring[(xd_seq++) % XD_SYNC_RING];
+   e->sync = sync;
+   e->submitted_ns = os_time_get_nano();
+   e->seq = xd_seq;
+}
+
+void
+radv_xclipse_diag_submit(uint32_t ip_type, uint32_t cmd_buffers, uint32_t general_draws, uint32_t taskmesh_draws,
+                         uint32_t task_draws, uint32_t executions, uint32_t dispatch_pkts, uint32_t mesh_pkts,
+                         uint32_t wait_count, uint32_t signal_count)
+{
+   if (!radv_xclipse_submit_diag())
+      return;
+   const uint64_t now = os_time_get_nano();
+   const uint64_t gap_ms = xd_last_submit_ns ? (now - xd_last_submit_ns) / 1000000ull : 0;
+   xd_last_submit_ns = now;
+
+   /* Every submission is printed until the first 64, then one in 16: at 1.7 fps a frame is ~10
+    * submissions, so 64 lines is several frames of the steady state, and the gap to the previous
+    * submit is what shows a stalled queue (the ioctl itself is timed by RADV_XCLIPSE_PERF). */
+   const uint32_t submit_no = xd_submit_n++;
+   if (submit_no < 64 || (submit_no % 16) == 0)
+      fprintf(stderr, "radv: xclipse: submit #%u ip=%u cbs=%u draws=%u (general %u, taskmesh %u) task=%u exec=%u "
+                      "dispatch_pkts=%u mesh_pkts=%u waits=%u signals=%u since_last_ms=%llu\n",
+              submit_no, ip_type, cmd_buffers, general_draws + taskmesh_draws, general_draws, taskmesh_draws,
+              task_draws, executions, dispatch_pkts, mesh_pkts, wait_count, signal_count, (unsigned long long)gap_ms);
+   xd_reports++;
+}
+
+void
+radv_xclipse_native_trace_fence_wait(const void *active_sync, uint32_t fence_count, uint32_t wait_all, int result,
+                                     uint64_t wait_ns)
+{
+   if (radv_xclipse_submit_diag() && wait_ns >= 100000000ull) {
+      /* How long ago the submission behind this fence was handed to the kernel. If the age is about
+       * the wait, the GPU/kernel held the work for the whole wait; if it is much larger, the wait is
+       * for a submission that was already old when the wait began. */
+      uint64_t age_ms = 0, seq = 0;
+      bool found = false;
+      /* Backwards: the same sync object is signalled again every frame, so the ring can hold several
+       * submissions for this pointer and the newest one is the submission the wait is for. */
+      if (active_sync) {
+         const uint64_t newest = xd_seq;
+         for (unsigned n = 0; n < XD_SYNC_RING && n < newest; n++) {
+            const struct xd_sync *e = &xd_ring[(newest - 1 - n) % XD_SYNC_RING];
+            if (e->sync == active_sync) {
+               age_ms = (os_time_get_nano() - e->submitted_ns) / 1000000ull;
+               seq = e->seq;
+               found = true;
+               break;
+            }
+         }
+      }
+      fprintf(stderr, "radv: xclipse: fence wait_ms=%llu sync=%s submit_age_ms=%llu seq=%llu queues=%u wait_all=%u "
+                      "result=%d submits_reported_so_far=%u\n",
+              (unsigned long long)(wait_ns / 1000000ull), found ? "tracked" : "untracked",
+              (unsigned long long)age_ms, (unsigned long long)seq, fence_count, wait_all, result, xd_reports);
+   }
+
    if (!trace_enabled() || wait_ns < 100000000ull)
       return;
 

@@ -8725,11 +8725,25 @@ xclipse_census_draw(struct radv_cmd_buffer *cmd_buffer, enum xclipse_draw_path p
 /* Every entry into the draw paths, so a frame's mix is counted rather than assumed: the application's
  * draws, the task/mesh draws that go through this emulation, and the task draws it emits packets for. */
 static void
-xclipse_census_other_draw(struct radv_cmd_buffer *cmd_buffer)
+xclipse_census_other_draw(struct radv_cmd_buffer *cmd_buffer, uint32_t draws)
 {
    if (!xclipse_packet_census())
       return;
    cmd_buffer->xc_census.general_draws++;
+   if (draws == 0)
+      cmd_buffer->xc_census.empty_draws++;
+   else if (draws > 1) {
+      cmd_buffer->xc_census.multi_draws++;
+      cmd_buffer->xc_census.multi_instances += draws;
+   }
+}
+
+static void
+xclipse_census_dispatch(struct radv_cmd_buffer *cmd_buffer)
+{
+   if (!xclipse_packet_census())
+      return;
+   cmd_buffer->xc_census.dispatch_calls++;
 }
 
 static void
@@ -8760,7 +8774,10 @@ xclipse_census_report(struct radv_cmd_buffer *cmd_buffer)
    const struct xclipse_packet_census *c = &cmd_buffer->xc_census;
    const uint32_t dispatch_packets = c->dispatch_direct + c->dispatch_indirect + c->dispatch_batch;
 
-   if (!xclipse_packet_census() || (!c->task_draws && !dispatch_packets && !c->mesh_packets))
+   /* A command buffer that recorded only ordinary draws still has to be reported: dropping it is what
+    * made the census unable to say how many draws the driver records per frame. */
+   if (!xclipse_packet_census() || (!c->general_draws && !c->taskmesh_draws && !c->task_draws && !dispatch_packets &&
+                                    !c->mesh_packets))
       return;
 
    const double rec_ms = c->begin_ns ? (double)(os_time_get_nano() - (int64_t)c->begin_ns) / 1e6 : 0.0;
@@ -8768,11 +8785,13 @@ xclipse_census_report(struct radv_cmd_buffer *cmd_buffer)
    fprintf(stderr,
            "radv: xclipse: census rec=%.2fms task_draws=%u (direct %u, indirect %u x sub %u, multidim %u, "
            "oversize %u, empty %u, batched %u) dispatch_pkts=%u (direct %u, indirect %u, batch %u) mesh_pkts=%u "
-           "draws=%u (general %u, taskmesh %u) batches=%u merged=%u max_merged=%u\n",
+           "api_calls=%u (general %u [multi %u x %u, empty %u], taskmesh %u, dispatch %u) level=%s "
+           "batches=%u merged=%u max_merged=%u\n",
            rec_ms, c->task_draws, c->path_direct, c->indirect_apps, c->indirect_subs, c->path_multidim,
            c->path_oversize, c->path_empty, c->batched, dispatch_packets, c->dispatch_direct, c->dispatch_indirect,
            c->dispatch_batch, c->mesh_packets, c->general_draws + c->taskmesh_draws, c->general_draws,
-           c->taskmesh_draws, c->batches, c->merged_draws, c->max_merge);
+           c->multi_draws, c->multi_instances, c->empty_draws, c->taskmesh_draws, c->dispatch_calls,
+           c->secondary ? "secondary" : "primary", c->batches, c->merged_draws, c->max_merge);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -8788,6 +8807,7 @@ radv_BeginCommandBuffer(VkCommandBuffer commandBuffer, const VkCommandBufferBegi
    cmd_buffer->xclipse_batch_task = NULL;
    cmd_buffer->xclipse_batch_mesh = NULL;
    memset(&cmd_buffer->xc_census, 0, sizeof(cmd_buffer->xc_census));
+   cmd_buffer->xc_census.secondary = cmd_buffer->vk.level == VK_COMMAND_BUFFER_LEVEL_SECONDARY;
    cmd_buffer->xc_census.begin_ns = xclipse_packet_census() ? os_time_get_nano() : 0;
    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
    const struct radv_physical_device *pdev = radv_device_physical(device);
@@ -11153,6 +11173,22 @@ radv_CmdExecuteCommands(VkCommandBuffer commandBuffer, uint32_t commandBufferCou
    VK_FROM_HANDLE(radv_cmd_buffer, primary, commandBuffer);
 
    XCLIPSE_BATCH_FLUSH_TAG(primary, "execute");
+
+   /* Execution, as opposed to recording: a secondary's packets reach the hardware once per execution,
+    * so the parent's execution is where that multiplier is counted. It is reported at submit time,
+    * because a child's own EndCommandBuffer runs before any parent executes it. */
+   if (xclipse_packet_census()) {
+      for (uint32_t i = 0; i < commandBufferCount; i++) {
+         VK_FROM_HANDLE(radv_cmd_buffer, child, pCmdBuffers[i]);
+         if (child && child != primary) {
+            child->xc_census.executions++;
+            /* The primary's stream now carries the child's packets, so the submit side can say how
+             * many child streams a submission folded in (the child itself is not submitted). */
+            primary->xc_census.executions++;
+         }
+      }
+   }
+
    struct radv_device *device = radv_cmd_buffer_device(primary);
    const struct radv_physical_device *pdev = radv_device_physical(device);
    const bool is_gfx_or_ace = primary->qf == RADV_QUEUE_GENERAL || primary->qf == RADV_QUEUE_COMPUTE;
@@ -15097,7 +15133,14 @@ ALWAYS_INLINE static bool
 radv_before_draw(struct radv_cmd_buffer *cmd_buffer, const struct radv_draw_info *info, uint32_t drawCount,
                  uint32_t max_indirect_draw_count, bool dgc)
 {
-   xclipse_census_other_draw(cmd_buffer);
+   /* How many draws this one call can put on the GPU, mirroring the early-outs below: an indirect
+    * draw carries instance_count = 0 and its draw count in max_indirect_draw_count, so testing
+    * instance_count alone would file every indirect draw as empty. DrawIndirectByteCount has count 0
+    * and is still drawn, so strmout_va keeps it. */
+   xclipse_census_other_draw(cmd_buffer,
+                             info->indirect_va
+                                ? max_indirect_draw_count
+                                : (!info->instance_count || (!info->count && !info->strmout_va)) ? 0 : drawCount);
    const struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
    const struct radv_physical_device *pdev = radv_device_physical(device);
    struct radv_cmd_stream *cs = cmd_buffer->cs;
@@ -16078,11 +16121,15 @@ radv_xclipse_emit_task_dispatch_draw(struct radv_cmd_buffer *cmd_buffer, const u
 /* RADV_XCLIPSE_MESHBATCH (diagnostic, read per draw, live): merge up to n consecutive task draws into
  * one DISPATCH and one DRAW_INDIRECT_MULTI over the whole ring window, instead of one pair per draw.
  *
- * The emulated task/mesh path costs ~0.85 ms per DISPATCH packet on this firmware and a dense scene
- * issues ~1,100 of them a frame, which is the whole 30 fps -> 1.6 fps collapse (MESHTINY=1, one
- * workgroup per packet, changes nothing; MESHSKIP=n scales with the packet count). A batch is only
- * extended while the task/mesh/descriptor state is untouched and the ring window still fits, and any
- * other recorded command flushes it. 0 and 1 are the unbatched path, byte for byte. */
+ * This is a timing-only diagnostic, NOT a performance strategy, and it does not work: two device runs
+ * show every batch closing after one draw (avg 1.00), and a census run with the app at 0.3.45 counted
+ * ~14 task draws a frame, not the ~1,100 once assumed -- a 10x increase in dispatch packets
+ * (RADV_XCLIPSE_SPLIT=1, 13.5 -> 136 a frame) left the frame time unchanged, so a per-packet cost is
+ * not what limits this scene. Batched dispatches also change the workgroup ids the application reads
+ * (gl_NumWorkGroups), so a merged batch needs a per-workgroup remap before it can be correct.
+ *
+ * A batch is only extended while the task/mesh/descriptor state is untouched and the ring window still
+ * fits, and any other recorded command flushes it. 0 and 1 are the unbatched path, byte for byte. */
 static int
 xclipse_mesh_batch(void)
 {
@@ -17393,6 +17440,7 @@ static void
 radv_before_dispatch(struct radv_cmd_buffer *cmd_buffer, struct radv_compute_pipeline *pipeline,
                      const struct radv_dispatch_info *info, const struct radv_dispatch_params *params)
 {
+   xclipse_census_dispatch(cmd_buffer);
    const struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
    struct radv_cmd_stream *cs = radv_get_pm4_cs(cmd_buffer);
    const bool pipeline_is_dirty = !!(cmd_buffer->state.dirty & RADV_CMD_DIRTY_COMPUTE_PIPELINE);

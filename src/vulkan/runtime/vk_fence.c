@@ -40,7 +40,7 @@
 
 /* Defined by the RADV Xclipse build only; weak so other drivers keep linking. */
 #if defined(__GNUC__)
-void radv_xclipse_native_trace_fence_wait(uint32_t fence_count, uint32_t wait_all, int result,
+void radv_xclipse_native_trace_fence_wait(const void *active_sync, uint32_t fence_count, uint32_t wait_all, int result,
                                           uint64_t wait_ns) __attribute__((weak));
 #endif
 
@@ -303,7 +303,8 @@ vk_common_WaitForFences(VkDevice _device,
 #if defined(__GNUC__)
    /* The Xclipse trace is gated by RADV_XCLIPSE_MESH_DIAG=3 inside the hook. */
    if (radv_xclipse_native_trace_fence_wait)
-      radv_xclipse_native_trace_fence_wait(fenceCount, waitAll, result, wait_ns);
+      radv_xclipse_native_trace_fence_wait(fenceCount ? vk_fence_get_active_sync((struct vk_fence *)pFences[0]) : NULL,
+                                           fenceCount, waitAll, result, wait_ns);
 #endif
 
    STACK_ARRAY_FINISH(waits);

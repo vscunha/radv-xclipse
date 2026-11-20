@@ -37,7 +37,22 @@ void radv_xclipse_native_trace_record_submit(unsigned ip_type, unsigned ring, un
 
 void radv_xclipse_native_trace_present(struct radv_device *device);
 
-/* Weak hook used by the shared Vulkan fence code. */
-void radv_xclipse_native_trace_fence_wait(uint32_t fence_count, uint32_t wait_all, int result, uint64_t wait_ns);
+/* Weak hook used by the shared Vulkan fence code. `active_sync` is the vk_sync the wait blocks on
+ * (vk_fence_get_active_sync), which is the key radv_xclipse_diag_note_signal() recorded. */
+void radv_xclipse_native_trace_fence_wait(const void *active_sync, uint32_t fence_count, uint32_t wait_all,
+                                          int result, uint64_t wait_ns);
+
+/* ---- submit-side accounting (RADV_XCLIPSE_SUBMIT_DIAG, default off) -------------------------------
+ *
+ * Recording and execution are different quantities and the census only sees the first, so the
+ * submit side is counted where the hardware sees it: one line per vkQueueSubmit with the packets
+ * being handed over, and the age of the submission every long fence wait blocks on. The age is what
+ * separates "the GPU is executing this" from "this was queued ages ago and the GPU sits idle", which
+ * is the question the 550-630 ms frame time asks. */
+bool radv_xclipse_submit_diag(void);                                   /* env RADV_XCLIPSE_SUBMIT_DIAG */
+void radv_xclipse_diag_note_signal(const void *sync);                   /* one per signalled sync */
+void radv_xclipse_diag_submit(uint32_t ip_type, uint32_t cmd_buffers, uint32_t general_draws, uint32_t taskmesh_draws,
+                              uint32_t task_draws, uint32_t executions, uint32_t dispatch_pkts, uint32_t mesh_pkts,
+                              uint32_t wait_count, uint32_t signal_count);
 
 #endif /* RADV_XCLIPSE_NATIVE_TRACE_H */
