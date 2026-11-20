@@ -8722,6 +8722,24 @@ xclipse_census_draw(struct radv_cmd_buffer *cmd_buffer, enum xclipse_draw_path p
    }
 }
 
+/* Every entry into the draw paths, so a frame's mix is counted rather than assumed: the application's
+ * draws, the task/mesh draws that go through this emulation, and the task draws it emits packets for. */
+static void
+xclipse_census_other_draw(struct radv_cmd_buffer *cmd_buffer)
+{
+   if (!xclipse_packet_census())
+      return;
+   cmd_buffer->xc_census.general_draws++;
+}
+
+static void
+xclipse_census_taskmesh_draw(struct radv_cmd_buffer *cmd_buffer)
+{
+   if (!xclipse_packet_census())
+      return;
+   cmd_buffer->xc_census.taskmesh_draws++;
+}
+
 static void
 xclipse_census_merge(struct radv_cmd_buffer *cmd_buffer, uint32_t draws)
 {
@@ -8750,10 +8768,11 @@ xclipse_census_report(struct radv_cmd_buffer *cmd_buffer)
    fprintf(stderr,
            "radv: xclipse: census rec=%.2fms task_draws=%u (direct %u, indirect %u x sub %u, multidim %u, "
            "oversize %u, empty %u, batched %u) dispatch_pkts=%u (direct %u, indirect %u, batch %u) mesh_pkts=%u "
-           "batches=%u merged=%u max_merged=%u\n",
+           "draws=%u (general %u, taskmesh %u) batches=%u merged=%u max_merged=%u\n",
            rec_ms, c->task_draws, c->path_direct, c->indirect_apps, c->indirect_subs, c->path_multidim,
            c->path_oversize, c->path_empty, c->batched, dispatch_packets, c->dispatch_direct, c->dispatch_indirect,
-           c->dispatch_batch, c->mesh_packets, c->batches, c->merged_draws, c->max_merge);
+           c->dispatch_batch, c->mesh_packets, c->general_draws + c->taskmesh_draws, c->general_draws,
+           c->taskmesh_draws, c->batches, c->merged_draws, c->max_merge);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -15078,6 +15097,7 @@ ALWAYS_INLINE static bool
 radv_before_draw(struct radv_cmd_buffer *cmd_buffer, const struct radv_draw_info *info, uint32_t drawCount,
                  uint32_t max_indirect_draw_count, bool dgc)
 {
+   xclipse_census_other_draw(cmd_buffer);
    const struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
    const struct radv_physical_device *pdev = radv_device_physical(device);
    struct radv_cmd_stream *cs = cmd_buffer->cs;
@@ -15210,6 +15230,7 @@ ALWAYS_INLINE static bool
 radv_before_taskmesh_draw(struct radv_cmd_buffer *cmd_buffer, const struct radv_draw_info *info,
                           const struct radv_taskmesh_userdata *userdata, bool dgc)
 {
+   xclipse_census_taskmesh_draw(cmd_buffer);
    const struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
    struct radv_cmd_stream *cs = cmd_buffer->cs;
 
