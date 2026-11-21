@@ -306,6 +306,7 @@ static uint64_t xd_seq;
 static uint64_t xd_last_submit_ns;
 static uint32_t xd_submit_n;
 static uint32_t xd_reports;
+static uint32_t xd_subs_at_last_wait;
 
 bool
 radv_xclipse_submit_diag(void)
@@ -381,10 +382,14 @@ radv_xclipse_native_trace_fence_wait(const void *active_sync, uint32_t fence_cou
             }
          }
       }
+      /* submits_since_last_wait is the frame's submission count when one long wait closes a frame: it is
+       * the number that has to fall if the per-submission cost is what sets the frame time. */
       fprintf(stderr, "radv: xclipse: fence wait_ms=%llu sync=%s submit_age_ms=%llu seq=%llu queues=%u wait_all=%u "
-                      "result=%d submits_reported_so_far=%u\n",
+                      "result=%d total_submits=%u submits_since_last_wait=%u\n",
               (unsigned long long)(wait_ns / 1000000ull), found ? "tracked" : "untracked",
-              (unsigned long long)age_ms, (unsigned long long)seq, fence_count, wait_all, result, xd_reports);
+              (unsigned long long)age_ms, (unsigned long long)seq, fence_count, wait_all, result, xd_submit_n,
+              xd_submit_n - xd_subs_at_last_wait);
+      xd_subs_at_last_wait = xd_submit_n;
    }
 
    if (!trace_enabled() || wait_ns < 100000000ull)

@@ -51,11 +51,12 @@ xperf_log(const char *fmt, ...)
    va_start(ap, fmt);
    vsnprintf(buf, sizeof(buf), fmt, ap);
    va_end(ap);
+   /* Both sinks: logcat is where a setprop-driven run is read, stderr is what a native game log keeps
+    * (an emulator's log never sees logcat, which is why RADV_XCLIPSE_PERF produced no lines there). */
 #ifdef __ANDROID__
    __android_log_print(ANDROID_LOG_INFO, "RADV_PERF", "%s", buf);
-#else
-   fprintf(stderr, "RADV_PERF: %s\n", buf);
 #endif
+   fprintf(stderr, "RADV_PERF: %s\n", buf);
 }
 
 static bool
