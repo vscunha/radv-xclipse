@@ -37,6 +37,16 @@ void radv_xclipse_native_trace_record_submit(unsigned ip_type, unsigned ring, un
 
 void radv_xclipse_native_trace_present(struct radv_device *device);
 
+/* ---- GPU-side end-of-submission clock (RADV_XCLIPSE_LATENCY, default off) --------------------------
+ *
+ * The emulator's GPU-busy figures come from CP timestamps, so they can only say how long the parts it
+ * stamped took, not when they ran. This writes one bottom-of-pipe timestamp at the end of every
+ * command buffer and, at each long fence wait, reads it back beside the GPU clock, which gives the
+ * only quantity that separates the two explanations for a 538 ms wait: how long ago the GPU finished
+ * the work the wait blocks on. Same clock on both sides, so no calibration is needed. */
+void radv_xclipse_latency_cb_end(struct radv_cmd_buffer *cmd_buffer);
+void radv_xclipse_latency_wait(uint64_t wait_ns);
+
 /* Weak hook used by the shared Vulkan fence code. `active_sync` is the vk_sync the wait blocks on
  * (vk_fence_get_active_sync), which is the key radv_xclipse_diag_note_signal() recorded. */
 void radv_xclipse_native_trace_fence_wait(const void *active_sync, uint32_t fence_count, uint32_t wait_all,

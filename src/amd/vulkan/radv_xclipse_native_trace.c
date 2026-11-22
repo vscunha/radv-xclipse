@@ -16,9 +16,11 @@
 #include "util/simple_mtx.h"
 #include "ac_gpu_info.h"
 #include "radv_cmd_buffer.h"
+#include "radv_cs.h"
 #include "radv_device.h"
 #include "radv_physical_device.h"
 #include "radv_radeon_winsys.h"
+#include "radv_query.h"
 #include "radv_shader.h"
 #include "radv_xclipse_mesh_diag.h"
 
@@ -358,10 +360,99 @@ radv_xclipse_diag_submit(uint32_t ip_type, uint32_t cmd_buffers, uint32_t genera
    xd_reports++;
 }
 
+/* ---- GPU-side end-of-submission clock ------------------------------------------------------- */
+
+static struct {
+   struct radeon_winsys *ws;
+   struct radeon_winsys_bo *bo;
+   volatile uint64_t *map; /* one 64-bit CP timestamp, the last command buffer to finish writes it */
+   uint64_t va;
+   double ns_per_tick;
+   bool failed;
+} xlat;
+
+static bool
+xclipse_latency_enabled(void)
+{
+   static int cached = -1;
+   if (cached < 0) {
+      const char *e = getenv("RADV_XCLIPSE_LATENCY");
+      cached = e && *e ? atoi(e) : 0;
+      if (cached)
+         fprintf(stderr, "radv: xclipse: latency %d: a bottom-of-pipe timestamp at the end of every command "
+                         "buffer, read beside the GPU clock at every fence wait over 100 ms\n", cached);
+   }
+   return cached != 0;
+}
+
+void
+radv_xclipse_latency_cb_end(struct radv_cmd_buffer *cmd_buffer)
+{
+   if (!xclipse_latency_enabled() || xlat.failed)
+      return;
+
+   struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
+   struct radeon_winsys *ws = device->ws;
+
+   /* The timestamp event is a graphics/compute packet: a transfer or video command buffer would get
+    * it in an IB the IP cannot execute (radv's own CmdWriteTimestamp2 guards the same way). */
+   if (cmd_buffer->qf != RADV_QUEUE_GENERAL && cmd_buffer->qf != RADV_QUEUE_COMPUTE)
+      return;
+
+   if (!xlat.bo) {
+      if (ws->buffer_create(ws, 4096, 4096, RADEON_DOMAIN_GTT,
+                            RADEON_FLAG_CPU_ACCESS | RADEON_FLAG_GTT_WC | RADEON_FLAG_NO_INTERPROCESS_SHARING, 0, 0,
+                            &xlat.bo) != VK_SUCCESS || !xlat.bo) {
+         xlat.failed = true;
+         fprintf(stderr, "radv: xclipse: latency: no timestamp buffer, instrument off\n");
+         return;
+      }
+      xlat.ws = ws;
+      xlat.map = ws->buffer_map(ws, xlat.bo, false, NULL);
+      xlat.va = radv_buffer_get_va(xlat.bo);
+      xlat.ns_per_tick = 1000000.0 / radv_device_physical(device)->info.clock_crystal_freq;
+      if (!xlat.map) {
+         xlat.failed = true;
+         return;
+      }
+      *xlat.map = 0;
+   }
+
+   /* Same packet a timestamp query uses; the last command buffer to finish owns the slot. Reserved
+    * like radv's own query path reserves for it, or the release build writes past max_dw. */
+   radeon_check_space(device->ws, cmd_buffer->cs->b, 32);
+   radv_cs_add_buffer(device->ws, cmd_buffer->cs->b, xlat.bo);
+   radv_write_timestamp(cmd_buffer, xlat.va, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT);
+}
+
+void
+radv_xclipse_latency_wait(uint64_t wait_ns)
+{
+   if (!xclipse_latency_enabled() || xlat.failed || !xlat.map || !xlat.ws || wait_ns < 100000000ull)
+      return;
+
+   const uint64_t end_ticks = *xlat.map; /* the GPU wrote this when the last command buffer retired */
+   if (!end_ticks)
+      return;
+
+   const uint64_t gpu_now_ns = xlat.ws->query_value(xlat.ws, RADEON_TIMESTAMP);
+   const uint64_t end_ns = (uint64_t)((double)end_ticks * xlat.ns_per_tick);
+   const int64_t idle_ms = ((int64_t)gpu_now_ns - (int64_t)end_ns) / 1000000;
+
+   /* idle_ms is how long before this wait ended the GPU finished the last stamped command buffer.
+    * The slot is shared, so any completion on any queue overwrites it: this is a LOWER bound on the
+    * idle time of the submission this fence waits on, exact while one submission is in flight. A
+    * value of hundreds of ms therefore means the GPU had been idle for at least that long; ~0 only
+    * says something finished just now, which is why the submit count on the same line matters. */
+   fprintf(stderr, "radv: xclipse: latency wait_ms=%llu gpu_idle_since_last_cb_ms=%lld\n",
+           (unsigned long long)(wait_ns / 1000000ull), (long long)idle_ms);
+}
+
 void
 radv_xclipse_native_trace_fence_wait(const void *active_sync, uint32_t fence_count, uint32_t wait_all, int result,
                                      uint64_t wait_ns)
 {
+   radv_xclipse_latency_wait(wait_ns);
    if (radv_xclipse_submit_diag() && wait_ns >= 100000000ull) {
       /* How long ago the submission behind this fence was handed to the kernel. If the age is about
        * the wait, the GPU/kernel held the work for the whole wait; if it is much larger, the wait is

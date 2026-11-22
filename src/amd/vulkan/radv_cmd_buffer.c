@@ -9530,6 +9530,7 @@ radv_EndCommandBuffer(VkCommandBuffer commandBuffer)
 
    XCLIPSE_BATCH_FLUSH_TAG(cmd_buffer, "end");
    xclipse_census_report(cmd_buffer);
+   radv_xclipse_latency_cb_end(cmd_buffer);
    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
    ASSERTED const struct radv_physical_device *pdev = radv_device_physical(device);
    struct radv_cmd_stream *cs = cmd_buffer->cs;
