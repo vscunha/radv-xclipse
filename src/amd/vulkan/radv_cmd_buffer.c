@@ -8820,11 +8820,12 @@ radv_BeginCommandBuffer(VkCommandBuffer commandBuffer, const VkCommandBufferBegi
 
    cmd_buffer->usage_flags = pBeginInfo->flags;
 
-   /* First packet of the stream when the latency instrument is on, so a recording instance carries
-    * the GPU's own arrival time as well as its completion. */
-   radv_xclipse_latency_cb_begin(cmd_buffer);
-
    radv_init_default_state(cmd_buffer);
+
+   /* Registered here, and at level 2 it also emits the GPU arrival timestamp. It goes after the
+    * prologue rather than before it: the previous build put a timestamp event first in the stream and
+    * that run hung at a scene entry, so the head of the stream is not somewhere to experiment. */
+   radv_xclipse_latency_cb_begin(cmd_buffer);
 
    if (cmd_buffer->qf == RADV_QUEUE_COMPUTE || device->vk.enabled_features.taskShader) {
       uint32_t pred_value = 0;

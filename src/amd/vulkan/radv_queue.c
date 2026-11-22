@@ -2105,10 +2105,12 @@ radv_queue_submit(struct vk_queue *vqueue, struct vk_queue_submit *submission)
       u_xclipse_prof_wait(U_XCLIPSE_WAIT_SUBMIT, os_time_get_nano() - xprof_t0);
    RADV_CPU_T1(RADV_CPU_SUBMIT);
 
-   /* Attach the submit sequence to the recordings it carries (off by default, checks its own knob). */
+   /* One sequence number per submission, shared by the recording chain and the fence ring, so a fence
+    * wait resolves to records that exist and not to a number from another counter. */
+   const uint64_t sub_seq = radv_xclipse_next_submit_seq();
    if (r == VK_SUCCESS)
-      radv_xclipse_latency_submit((const void *const *)submission->command_buffers,
-                                  submission->command_buffer_count);
+      radv_xclipse_latency_submit((const void *const *)submission->command_buffers, submission->command_buffer_count,
+                                  sub_seq);
 
    /* Submit-side accounting (off by default): what is being handed to the hardware now, and when each
     * signalled sync was, so a later fence wait can say how old the submission it blocks on is. */
@@ -2124,8 +2126,8 @@ radv_queue_submit(struct vk_queue *vqueue, struct vk_queue_submit *submission)
          mesh += cb->xc_census.mesh_packets;
       }
       for (uint32_t i = 0; i < submission->signal_count; i++)
-         radv_xclipse_diag_note_signal(submission->signals[i].sync);
-      radv_xclipse_diag_submit(radv_queue_ring((struct radv_queue *)vqueue), submission->command_buffer_count, draws,
+         radv_xclipse_diag_note_signal(submission->signals[i].sync, sub_seq);
+      radv_xclipse_diag_submit(sub_seq, radv_queue_ring((struct radv_queue *)vqueue), submission->command_buffer_count, draws,
                                taskmesh, task, exec, dispatch, mesh, submission->wait_count,
                                submission->signal_count);
    }

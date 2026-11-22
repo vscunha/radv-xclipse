@@ -309,11 +309,20 @@ struct xd_sync {
 };
 
 static struct xd_sync xd_ring[XD_SYNC_RING];
-static uint64_t xd_seq;
+static uint64_t xd_seq;      /* submissions seen: the one sequence number the fence ring and the
+                              * recording chain both use, so a wait can be resolved against records */
+static uint64_t xd_ring_n;   /* ring position, advanced per signalled sync */
 static uint64_t xd_last_submit_ns;
-static uint32_t xd_submit_n;
 static uint32_t xd_reports;
-static uint32_t xd_subs_at_last_wait;
+static uint64_t xd_subs_at_last_wait;
+
+/* Called once per vkQueueSubmit, before the submission is described, so both the fence ring and the
+ * recording chain carry the same number. */
+uint64_t
+radv_xclipse_next_submit_seq(void)
+{
+   return ++xd_seq;
+}
 
 bool
 radv_xclipse_submit_diag(void)
@@ -332,20 +341,22 @@ radv_xclipse_submit_diag(void)
 /* A sync signalled by a submission; the ring is small because only the last few submissions can still
  * be waited on (the app's slots are reused in order). */
 void
-radv_xclipse_diag_note_signal(const void *sync)
+radv_xclipse_diag_note_signal(const void *sync, uint64_t submit_seq)
 {
    if (!sync || !radv_xclipse_submit_diag())
       return;
-   struct xd_sync *e = &xd_ring[(xd_seq++) % XD_SYNC_RING];
+   /* The ring position advances per signal; the sequence it records is the submission's, so a wait
+    * resolves to a submission that also has recording records. */
+   struct xd_sync *e = &xd_ring[(xd_ring_n++) % XD_SYNC_RING];
    e->sync = sync;
    e->submitted_ns = os_time_get_nano();
-   e->seq = xd_seq;
+   e->seq = submit_seq;
 }
 
 void
-radv_xclipse_diag_submit(uint32_t ip_type, uint32_t cmd_buffers, uint32_t general_draws, uint32_t taskmesh_draws,
-                         uint32_t task_draws, uint32_t executions, uint32_t dispatch_pkts, uint32_t mesh_pkts,
-                         uint32_t wait_count, uint32_t signal_count)
+radv_xclipse_diag_submit(uint64_t submit_seq, uint32_t ip_type, uint32_t cmd_buffers, uint32_t general_draws,
+                         uint32_t taskmesh_draws, uint32_t task_draws, uint32_t executions, uint32_t dispatch_pkts,
+                         uint32_t mesh_pkts, uint32_t wait_count, uint32_t signal_count)
 {
    if (!radv_xclipse_submit_diag())
       return;
@@ -356,11 +367,11 @@ radv_xclipse_diag_submit(uint32_t ip_type, uint32_t cmd_buffers, uint32_t genera
    /* Every submission is printed until the first 64, then one in 16: at 1.7 fps a frame is ~10
     * submissions, so 64 lines is several frames of the steady state, and the gap to the previous
     * submit is what shows a stalled queue (the ioctl itself is timed by RADV_XCLIPSE_PERF). */
-   const uint32_t submit_no = xd_submit_n++;
+   const uint64_t submit_no = submit_seq;
    if (submit_no < 64 || (submit_no % 16) == 0)
-      fprintf(stderr, "radv: xclipse: submit #%u ip=%u cbs=%u draws=%u (general %u, taskmesh %u) task=%u exec=%u "
+      fprintf(stderr, "radv: xclipse: submit #%llu ip=%u cbs=%u draws=%u (general %u, taskmesh %u) task=%u exec=%u "
                       "dispatch_pkts=%u mesh_pkts=%u waits=%u signals=%u since_last_ms=%llu\n",
-              submit_no, ip_type, cmd_buffers, general_draws + taskmesh_draws, general_draws, taskmesh_draws,
+              (unsigned long long)submit_no, ip_type, cmd_buffers, general_draws + taskmesh_draws, general_draws, taskmesh_draws,
               task_draws, executions, dispatch_pkts, mesh_pkts, wait_count, signal_count, (unsigned long long)gap_ms);
    xd_reports++;
 }
@@ -402,7 +413,6 @@ static struct {
 static struct xlat_rec xlat_recs[XLAT_REC_MAX];
 static uint64_t xlat_seen[XLAT_SLOTS]; /* last sampled value of every slot, host side */
 static uint64_t xlat_rec_next;
-static uint64_t xlat_submit_next;
 static uint64_t xlat_uninstrumented; /* command buffers whose queue family cannot carry the packet */
 static uint64_t xlat_wraps;          /* ring entries reused before their submission was seen */
 static uint64_t xlat_unrecorded;     /* submitted command buffers with no recording record */
@@ -415,18 +425,29 @@ static pthread_mutex_t xlat_mu = PTHREAD_MUTEX_INITIALIZER;
 static unsigned xlat_overlaps; /* waits skipped because another wait held the pair */
 
 
-static bool
-xclipse_latency_enabled(void)
+/* 1: completion timestamp per recording, submission chain, per-wait and per-window thread CPU.
+ * 2: also the top-of-pipe arrival timestamp, which is what a per-submission GPU span needs. Kept
+ *    separate because the level-2 build is the only one that writes a packet ahead of a recording's
+ *    own work, and the run that did so hung at a scene entry. */
+static int
+xclipse_latency_level(void)
 {
    static int cached = -1;
    if (cached < 0) {
       const char *e = getenv("RADV_XCLIPSE_LATENCY");
       cached = e && *e ? atoi(e) : 0;
       if (cached)
-         fprintf(stderr, "radv: xclipse: latency %d: bottom-of-pipe timestamp per command buffer, per-wait and "
-                         "per-window thread CPU\n", cached);
+         fprintf(stderr, "radv: xclipse: latency %d: %s, submission chain between recording and fence, per-wait and "
+                         "per-window thread CPU\n", cached,
+                 cached >= 2 ? "top and bottom of pipe timestamp per recording" : "completion timestamp per recording");
    }
-   return cached != 0;
+   return cached > 0 ? cached : 0;
+}
+
+static bool
+xclipse_latency_enabled(void)
+{
+   return xclipse_latency_level() != 0;
 }
 
 static void xclipse_thread_cpu_window(void);
@@ -524,8 +545,10 @@ radv_xclipse_latency_cb_begin(struct radv_cmd_buffer *cmd_buffer)
    cmd_buffer->xc_lat_rec = rec;
    pthread_mutex_unlock(&xlat_mu);
 
-   /* Top of pipe: when the GPU reached this recording's first packet. Recorded, not submitted, so
-    * this is execution-time evidence and needs no host clock to interpret. */
+   if (xclipse_latency_level() < 2)
+      return;
+   /* Top of pipe: when the GPU reached this recording's first packet after its prologue. Only at
+    * level 2, and never the first packet of the stream. */
    radeon_check_space(device->ws, cmd_buffer->cs->b, 32);
    radv_cs_add_buffer(device->ws, cmd_buffer->cs->b, xlat.bo);
    radv_write_timestamp(cmd_buffer, xlat.va + (uint64_t)ring * 16, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT);
@@ -562,13 +585,12 @@ radv_xclipse_latency_cb_end(struct radv_cmd_buffer *cmd_buffer)
  * sequence to every recording instance in it, so a later retirement in a slot can be placed in the
  * submit order, and reports what has been observed to retire since the previous sample. */
 void
-radv_xclipse_latency_submit(const void *const *cbs, unsigned count)
+radv_xclipse_latency_submit(const void *const *cbs, unsigned count, uint64_t submit)
 {
    if (!xclipse_latency_enabled() || xlat.failed || !xlat.map)
       return;
 
    pthread_mutex_lock(&xlat_mu);
-   const uint64_t submit = ++xlat_submit_next;
    for (unsigned i = 0; i < count; i++) {
       struct xlat_rec *best = NULL;
       for (unsigned r = 0; r < XLAT_REC_MAX; r++) {
@@ -965,11 +987,11 @@ radv_xclipse_native_trace_fence_wait(const void *active_sync, uint32_t fence_cou
       /* submits_since_last_wait is the frame's submission count when one long wait closes a frame: it is
        * the number that has to fall if the per-submission cost is what sets the frame time. */
       fprintf(stderr, "radv: xclipse: fence wait_ms=%llu sync=%s submit_age_ms=%llu seq=%llu queues=%u wait_all=%u "
-                      "result=%d total_submits=%u submits_since_last_wait=%u\n",
+                      "result=%d total_submits=%llu submits_since_last_wait=%llu\n",
               (unsigned long long)(wait_ns / 1000000ull), found ? "tracked" : "untracked",
-              (unsigned long long)age_ms, (unsigned long long)seq, fence_count, wait_all, result, xd_submit_n,
-              xd_submit_n - xd_subs_at_last_wait);
-      xd_subs_at_last_wait = xd_submit_n;
+              (unsigned long long)age_ms, (unsigned long long)seq, fence_count, wait_all, result,
+              (unsigned long long)xd_seq, (unsigned long long)(xd_seq - xd_subs_at_last_wait));
+      xd_subs_at_last_wait = xd_seq;
       if (found)
          waited_submit = seq;
    }

@@ -46,7 +46,8 @@ void radv_xclipse_native_trace_present(struct radv_device *device);
  * the work the wait blocks on. Same clock on both sides, so no calibration is needed. */
 void radv_xclipse_latency_cb_begin(struct radv_cmd_buffer *cmd_buffer);
 void radv_xclipse_latency_cb_end(struct radv_cmd_buffer *cmd_buffer);
-void radv_xclipse_latency_submit(const void *const *cbs, unsigned count);
+void radv_xclipse_latency_submit(const void *const *cbs, unsigned count, uint64_t submit);
+uint64_t radv_xclipse_next_submit_seq(void);
 void radv_xclipse_latency_wait(uint64_t wait_ns, uint64_t waited_submit);
 void radv_xclipse_native_trace_fence_wait_begin(uint32_t fence_count, uint32_t wait_all);
 
@@ -63,8 +64,8 @@ void radv_xclipse_native_trace_fence_wait(const void *active_sync, uint32_t fenc
  * separates "the GPU is executing this" from "this was queued ages ago and the GPU sits idle", which
  * is the question the 550-630 ms frame time asks. */
 bool radv_xclipse_submit_diag(void);                                   /* env RADV_XCLIPSE_SUBMIT_DIAG */
-void radv_xclipse_diag_note_signal(const void *sync);                   /* one per signalled sync */
-void radv_xclipse_diag_submit(uint32_t ip_type, uint32_t cmd_buffers, uint32_t general_draws, uint32_t taskmesh_draws,
+void radv_xclipse_diag_note_signal(const void *sync, uint64_t submit_seq);                   /* one per signalled sync */
+void radv_xclipse_diag_submit(uint64_t submit_seq, uint32_t ip_type, uint32_t cmd_buffers, uint32_t general_draws, uint32_t taskmesh_draws,
                               uint32_t task_draws, uint32_t executions, uint32_t dispatch_pkts, uint32_t mesh_pkts,
                               uint32_t wait_count, uint32_t signal_count);
 
