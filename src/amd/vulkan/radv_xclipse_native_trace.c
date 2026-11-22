@@ -660,6 +660,12 @@ static pthread_mutex_t xlat_win_mu = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t xlat_tick_ns; /* nanoseconds per clock tick, from sysconf(_SC_CLK_TCK) */
 
 static struct xlat_snap xlat_win_pre, xlat_win_now;
+
+/* Where the wall clock goes, split by what this driver can see. 'other' is time the process spends
+ * outside every Vulkan call the driver can hook, which is the emulator's own work plus the game's:
+ * the split decides whether the frame is spent on our side of the API boundary at all. */
+static uint64_t xlat_phase_submit_ns, xlat_phase_wait_ns;
+static uint64_t xlat_phase_submits, xlat_phase_waits;
 static struct xlat_snap xlat_wait_pre, xlat_wait_now;
 static uint64_t xlat_win_start_ns, xlat_win_pre_proc_ns;
 static bool xlat_win_have;
@@ -843,6 +849,19 @@ xclipse_thread_cpu_window(void)
          char list[256];
          xclipse_format_top(list, sizeof(list), top, n);
          const uint64_t proc_delta = proc - xlat_win_pre_proc_ns;
+         const uint64_t ph_submit = __atomic_exchange_n(&xlat_phase_submit_ns, 0, __ATOMIC_RELAXED);
+         const uint64_t ph_wait = __atomic_exchange_n(&xlat_phase_wait_ns, 0, __ATOMIC_RELAXED);
+         const uint64_t ph_nsub = __atomic_exchange_n(&xlat_phase_submits, 0, __ATOMIC_RELAXED);
+         const uint64_t ph_nwait = __atomic_exchange_n(&xlat_phase_waits, 0, __ATOMIC_RELAXED);
+         const uint64_t wall_ns = now - xlat_win_start_ns;
+         const uint64_t other_ns = wall_ns > ph_submit + ph_wait ? wall_ns - ph_submit - ph_wait : 0;
+         fprintf(stderr,
+                 "radv: xclipse: phase window_ms=%llu submits=%llu in_submit_ms=%llu waits=%llu in_wait_ms=%llu "
+                 "outside_ms=%llu (%.0f%% of window outside every hooked call)\n",
+                 (unsigned long long)(wall_ns / 1000000ull), (unsigned long long)ph_nsub,
+                 (unsigned long long)(ph_submit / 1000000ull), (unsigned long long)ph_nwait,
+                 (unsigned long long)(ph_wait / 1000000ull), (unsigned long long)(other_ns / 1000000ull),
+                 wall_ns ? (double)other_ns * 100.0 / (double)wall_ns : 0.0);
          fprintf(stderr,
                  "radv: xclipse: threadcpu window_ms=%llu threads=%u%s proc_cpu_ms=%llu acct=%d%% top5=[%s]\n",
                  (unsigned long long)((now - xlat_win_start_ns) / 1000000ull), xlat_win_now.n,
@@ -858,6 +877,24 @@ xclipse_thread_cpu_window(void)
 }
 /* A wait is bracketed so the retirements observed inside it are attributable to it. The mutex is
  * held across the pair, so overlapping waits are skipped and counted instead of interleaved. */
+void
+radv_xclipse_phase_submit(uint64_t ns)
+{
+   if (!xclipse_latency_enabled())
+      return;
+   __atomic_add_fetch(&xlat_phase_submit_ns, ns, __ATOMIC_RELAXED);
+   __atomic_add_fetch(&xlat_phase_submits, 1, __ATOMIC_RELAXED);
+}
+
+void
+radv_xclipse_phase_wait(uint64_t ns)
+{
+   if (!xclipse_latency_enabled())
+      return;
+   __atomic_add_fetch(&xlat_phase_wait_ns, ns, __ATOMIC_RELAXED);
+   __atomic_add_fetch(&xlat_phase_waits, 1, __ATOMIC_RELAXED);
+}
+
 void
 radv_xclipse_native_trace_fence_wait_begin(uint32_t fence_count, uint32_t wait_all)
 {
@@ -971,6 +1008,8 @@ void
 radv_xclipse_native_trace_fence_wait(const void *active_sync, uint32_t fence_count, uint32_t wait_all, int result,
                                      uint64_t wait_ns)
 {
+   radv_xclipse_phase_wait(wait_ns);
+
    uint64_t waited_submit = 0;
    if (radv_xclipse_submit_diag() && wait_ns >= 100000000ull) {
       /* How long ago the submission behind this fence was handed to the kernel. If the age is about

@@ -2100,7 +2100,9 @@ radv_queue_submit(struct vk_queue *vqueue, struct vk_queue_submit *submission)
 {
    RADV_CPU_T0();
    const int64_t xprof_t0 = u_xclipse_prof_active() ? os_time_get_nano() : 0;
+   const uint64_t xlat_t0 = os_time_get_nano();
    const VkResult r = radv_queue_submit_timed(vqueue, submission);
+   radv_xclipse_phase_submit(os_time_get_nano() - xlat_t0);
    if (xprof_t0)
       u_xclipse_prof_wait(U_XCLIPSE_WAIT_SUBMIT, os_time_get_nano() - xprof_t0);
    RADV_CPU_T1(RADV_CPU_SUBMIT);
