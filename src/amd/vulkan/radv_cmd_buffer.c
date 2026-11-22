@@ -8820,6 +8820,10 @@ radv_BeginCommandBuffer(VkCommandBuffer commandBuffer, const VkCommandBufferBegi
 
    cmd_buffer->usage_flags = pBeginInfo->flags;
 
+   /* First packet of the stream when the latency instrument is on, so a recording instance carries
+    * the GPU's own arrival time as well as its completion. */
+   radv_xclipse_latency_cb_begin(cmd_buffer);
+
    radv_init_default_state(cmd_buffer);
 
    if (cmd_buffer->qf == RADV_QUEUE_COMPUTE || device->vk.enabled_features.taskShader) {

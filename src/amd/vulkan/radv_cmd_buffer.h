@@ -633,6 +633,7 @@ struct radv_cmd_buffer {
    /* RADV_XCLIPSE_PACKET_CENSUS=1: what this recording emitted, counted at the emit sites so hardware
     * packets are never confused with the logical draws the application asked for. */
    struct xclipse_packet_census xc_census;
+   uint64_t xc_lat_rec; /* RADV_XCLIPSE_LATENCY recording instance, 0 = none */
 };
 
 struct radv_msrtss_transient {

@@ -2105,6 +2105,11 @@ radv_queue_submit(struct vk_queue *vqueue, struct vk_queue_submit *submission)
       u_xclipse_prof_wait(U_XCLIPSE_WAIT_SUBMIT, os_time_get_nano() - xprof_t0);
    RADV_CPU_T1(RADV_CPU_SUBMIT);
 
+   /* Attach the submit sequence to the recordings it carries (off by default, checks its own knob). */
+   if (r == VK_SUCCESS)
+      radv_xclipse_latency_submit((const void *const *)submission->command_buffers,
+                                  submission->command_buffer_count);
+
    /* Submit-side accounting (off by default): what is being handed to the hardware now, and when each
     * signalled sync was, so a later fence wait can say how old the submission it blocks on is. */
    if (r == VK_SUCCESS && radv_xclipse_submit_diag()) {

@@ -44,8 +44,10 @@ void radv_xclipse_native_trace_present(struct radv_device *device);
  * command buffer and, at each long fence wait, reads it back beside the GPU clock, which gives the
  * only quantity that separates the two explanations for a 538 ms wait: how long ago the GPU finished
  * the work the wait blocks on. Same clock on both sides, so no calibration is needed. */
+void radv_xclipse_latency_cb_begin(struct radv_cmd_buffer *cmd_buffer);
 void radv_xclipse_latency_cb_end(struct radv_cmd_buffer *cmd_buffer);
-void radv_xclipse_latency_wait(uint64_t wait_ns);
+void radv_xclipse_latency_submit(const void *const *cbs, unsigned count);
+void radv_xclipse_latency_wait(uint64_t wait_ns, uint64_t waited_submit);
 void radv_xclipse_native_trace_fence_wait_begin(uint32_t fence_count, uint32_t wait_all);
 
 /* Weak hook used by the shared Vulkan fence code. `active_sync` is the vk_sync the wait blocks on
