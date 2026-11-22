@@ -22,6 +22,7 @@
 #include "radv_radeon_winsys.h"
 #include <dirent.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -419,10 +420,13 @@ static uint64_t xlat_unrecorded;     /* submitted command buffers with no record
 static uint64_t xlat_reused;         /* command buffers submitted again after a first submit */
 static uint64_t xlat_slotless;       /* retirements seen in slots whose record was overwritten */
 
-/* Guards every table above and the slot allocation: command buffers can be recorded on several
- * threads at once, and a wait can be in flight on another. */
-static pthread_mutex_t xlat_mu = PTHREAD_MUTEX_INITIALIZER;
-static unsigned xlat_overlaps; /* waits skipped because another wait held the pair */
+/* Nothing in this instrument may block a recording thread. An earlier version held a mutex across a
+ * fence wait, which is held for seconds here, and took the same mutex while recording: that stalls
+ * submission behind the wait, and the emulator reports the resulting gap as a GPU hang. So the tables
+ * are lock-free diagnostics (benign races, per-recording entries) and only buffer creation serialises. */
+static pthread_mutex_t xlat_bo_mu = PTHREAD_MUTEX_INITIALIZER;
+static atomic_bool xlat_wait_active;
+static unsigned xlat_overlaps; /* waits skipped because another wait was already bracketed */
 
 
 /* 1: completion timestamp per recording, submission chain, per-wait and per-window thread CPU.
@@ -457,14 +461,20 @@ static void xclipse_thread_cpu_window(void);
 static bool
 xlat_ensure_bo(struct radv_device *device)
 {
-   if (xlat.bo)
+   if (__atomic_load_n(&xlat.bo, __ATOMIC_ACQUIRE))
       return true;
+   pthread_mutex_lock(&xlat_bo_mu);
+   if (xlat.bo) {
+      pthread_mutex_unlock(&xlat_bo_mu);
+      return true;
+   }
    struct radeon_winsys *ws = device->ws;
    if (ws->buffer_create(ws, XLAT_SLOTS * 8, 4096, RADEON_DOMAIN_GTT,
                          RADEON_FLAG_CPU_ACCESS | RADEON_FLAG_GTT_WC | RADEON_FLAG_NO_INTERPROCESS_SHARING, 0, 0,
                          &xlat.bo) != VK_SUCCESS ||
        !xlat.bo) {
       xlat.failed = true;
+      pthread_mutex_unlock(&xlat_bo_mu);
       fprintf(stderr, "radv: xclipse: latency: no timestamp buffer, instrument off\n");
       return false;
    }
@@ -474,6 +484,7 @@ xlat_ensure_bo(struct radv_device *device)
    xlat.ns_per_tick = 1000000.0 / (double)radv_device_physical(device)->info.clock_crystal_freq;
    if (!xlat.map) {
       xlat.failed = true;
+      pthread_mutex_unlock(&xlat_bo_mu);
       fprintf(stderr, "radv: xclipse: latency: timestamp buffer not mapped, instrument off\n");
       return false;
    }
@@ -481,6 +492,8 @@ xlat_ensure_bo(struct radv_device *device)
       xlat.map[i] = 0;
    for (unsigned i = 0; i < XLAT_SLOTS; i++)
       xlat_seen[i] = 0;
+   __atomic_store_n(&xlat.bo, xlat.bo, __ATOMIC_RELEASE);
+   pthread_mutex_unlock(&xlat_bo_mu);
    return true;
 }
 
@@ -523,27 +536,24 @@ radv_xclipse_latency_cb_begin(struct radv_cmd_buffer *cmd_buffer)
 
    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
    if (cmd_buffer->qf != RADV_QUEUE_GENERAL && cmd_buffer->qf != RADV_QUEUE_COMPUTE) {
-      pthread_mutex_lock(&xlat_mu);
-      xlat_uninstrumented++;
-      pthread_mutex_unlock(&xlat_mu);
+      __atomic_add_fetch(&xlat_uninstrumented, 1, __ATOMIC_RELAXED);
       return;
    }
 
-   pthread_mutex_lock(&xlat_mu);
-   if (!xlat_ensure_bo(device)) {
-      pthread_mutex_unlock(&xlat_mu);
+   if (!xlat_ensure_bo(device))
       return;
-   }
-   const uint64_t rec = ++xlat_rec_next;
+   const uint64_t rec = __atomic_add_fetch(&xlat_rec_next, 1, __ATOMIC_RELAXED);
    const unsigned ring = (unsigned)(rec % XLAT_REC_MAX);
    struct xlat_rec *r = &xlat_recs[ring];
    /* Overwriting an entry whose submission was never seen means a gap in the chain, not a
     * retirement; count it so the coverage figures stay honest. */
-   if (r->rec && !r->submit)
-      xlat_wraps++;
-   *r = (struct xlat_rec){.cb = cmd_buffer, .rec = rec};
+   if (__atomic_load_n(&r->rec, __ATOMIC_RELAXED) && !__atomic_load_n(&r->submit, __ATOMIC_RELAXED))
+      __atomic_add_fetch(&xlat_wraps, 1, __ATOMIC_RELAXED);
+   r->cb = cmd_buffer;
+   r->submit = 0;
+   r->ended = false;
+   __atomic_store_n(&r->rec, rec, __ATOMIC_RELAXED);
    cmd_buffer->xc_lat_rec = rec;
-   pthread_mutex_unlock(&xlat_mu);
 
    if (xclipse_latency_level() < 2)
       return;
@@ -572,13 +582,11 @@ radv_xclipse_latency_cb_end(struct radv_cmd_buffer *cmd_buffer)
    radv_cs_add_buffer(device->ws, cmd_buffer->cs->b, xlat.bo);
    radv_write_timestamp(cmd_buffer, xlat.va + (uint64_t)ring * 16 + 8, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT);
 
-   pthread_mutex_lock(&xlat_mu);
    struct xlat_rec *r = &xlat_recs[ring];
-   if (r->rec == rec) {
+   if (__atomic_load_n(&r->rec, __ATOMIC_RELAXED) == rec) {
       r->ended = true;
       r->end_host_ns = os_time_get_nano();
    }
-   pthread_mutex_unlock(&xlat_mu);
 }
 
 /* Called once per vkQueueSubmit, after the submission was handed to the kernel. Attaches the submit
@@ -590,7 +598,6 @@ radv_xclipse_latency_submit(const void *const *cbs, unsigned count, uint64_t sub
    if (!xclipse_latency_enabled() || xlat.failed || !xlat.map)
       return;
 
-   pthread_mutex_lock(&xlat_mu);
    for (unsigned i = 0; i < count; i++) {
       struct xlat_rec *best = NULL;
       for (unsigned r = 0; r < XLAT_REC_MAX; r++) {
@@ -618,7 +625,6 @@ radv_xclipse_latency_submit(const void *const *cbs, unsigned count, uint64_t sub
            (unsigned long long)xlat_rec_next, (unsigned long long)xlat_uninstrumented,
            (unsigned long long)xlat_unrecorded, (unsigned long long)xlat_reused, (unsigned long long)xlat_wraps,
            (unsigned long long)xlat_slotless);
-   pthread_mutex_unlock(&xlat_mu);
 }
 
 /* ---- per-thread CPU accounting (RADV_XCLIPSE_LATENCY) --------------------------------------- */
@@ -859,7 +865,9 @@ radv_xclipse_native_trace_fence_wait_begin(uint32_t fence_count, uint32_t wait_a
    (void)wait_all;
    if (!xclipse_latency_enabled() || xlat.failed || !xlat.map || !xlat.ws)
       return;
-   if (pthread_mutex_trylock(&xlat_mu) != 0) {
+   /* Non-blocking claim instead of a lock: a second concurrent wait is skipped, never queued behind
+    * the first, which can block for seconds. */
+   if (atomic_exchange(&xlat_wait_active, true)) {
       xlat_overlaps++;
       return;
    }
@@ -879,7 +887,7 @@ radv_xclipse_latency_wait(uint64_t wait_ns, uint64_t waited_submit)
    xlat_wait.armed = false;
 
    if (!xclipse_latency_enabled() || xlat.failed || !xlat.map || !xlat.ws || wait_ns < 100000000ull) {
-      pthread_mutex_unlock(&xlat_mu);
+      atomic_store(&xlat_wait_active, false);
       return;
    }
 
@@ -956,7 +964,7 @@ radv_xclipse_latency_wait(uint64_t wait_ns, uint64_t waited_submit)
            (long long)proc_cpu_ms, acct, xlat_wait_now.n, xlat_wait_now.truncated ? "(truncated)" : "",
            (unsigned long long)ioctl_ticks, list);
 
-   pthread_mutex_unlock(&xlat_mu);
+   atomic_store(&xlat_wait_active, false);
 }
 
 void
