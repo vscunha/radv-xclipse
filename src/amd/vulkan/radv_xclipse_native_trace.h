@@ -46,6 +46,7 @@ void radv_xclipse_native_trace_present(struct radv_device *device);
  * the work the wait blocks on. Same clock on both sides, so no calibration is needed. */
 void radv_xclipse_latency_cb_end(struct radv_cmd_buffer *cmd_buffer);
 void radv_xclipse_latency_wait(uint64_t wait_ns);
+void radv_xclipse_native_trace_fence_wait_begin(uint32_t fence_count, uint32_t wait_all);
 
 /* Weak hook used by the shared Vulkan fence code. `active_sync` is the vk_sync the wait blocks on
  * (vk_fence_get_active_sync), which is the key radv_xclipse_diag_note_signal() recorded. */

@@ -425,27 +425,56 @@ radv_xclipse_latency_cb_end(struct radv_cmd_buffer *cmd_buffer)
    radv_write_timestamp(cmd_buffer, xlat.va, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT);
 }
 
+/* Sampled around the wait, so the test needs no epoch and no unit: the same counter read twice. */
+static struct {
+   uint64_t ticks;
+   uint64_t gpu_ns;
+   uint64_t host_ns;
+   bool armed;
+} lat_pre;
+
+void
+radv_xclipse_native_trace_fence_wait_begin(uint32_t fence_count, uint32_t wait_all)
+{
+   (void)fence_count;
+   (void)wait_all;
+   lat_pre.armed = false;
+   if (!xclipse_latency_enabled() || xlat.failed || !xlat.map || !xlat.ws)
+      return;
+   lat_pre.ticks = *xlat.map;
+   lat_pre.gpu_ns = xlat.ws->query_value(xlat.ws, RADEON_TIMESTAMP);
+   lat_pre.host_ns = os_time_get_nano();
+   lat_pre.armed = true;
+}
+
 void
 radv_xclipse_latency_wait(uint64_t wait_ns)
 {
    if (!xclipse_latency_enabled() || xlat.failed || !xlat.map || !xlat.ws || wait_ns < 100000000ull)
       return;
-
-   const uint64_t end_ticks = *xlat.map; /* the GPU wrote this when the last command buffer retired */
-   if (!end_ticks)
+   if (!lat_pre.armed)
       return;
+   lat_pre.armed = false;
 
-   const uint64_t gpu_now_ns = xlat.ws->query_value(xlat.ws, RADEON_TIMESTAMP);
-   const uint64_t end_ns = (uint64_t)((double)end_ticks * xlat.ns_per_tick);
-   const int64_t idle_ms = ((int64_t)gpu_now_ns - (int64_t)end_ns) / 1000000;
+   const uint64_t ticks_now = *xlat.map;
+   const uint64_t gpu_ns = xlat.ws->query_value(xlat.ws, RADEON_TIMESTAMP);
+   /* An unchanged slot means no command buffer retired during the wait; a zero one means none ever
+    * did, which is reported as "no answer" rather than as "the GPU was idle". */
+   const bool retired = lat_pre.ticks != 0 && ticks_now != lat_pre.ticks;
 
-   /* idle_ms is how long before this wait ended the GPU finished the last stamped command buffer.
-    * The slot is shared, so any completion on any queue overwrites it: this is a LOWER bound on the
-    * idle time of the submission this fence waits on, exact while one submission is in flight. A
-    * value of hundreds of ms therefore means the GPU had been idle for at least that long; ~0 only
-    * says something finished just now, which is why the submit count on the same line matters. */
-   fprintf(stderr, "radv: xclipse: latency wait_ms=%llu gpu_idle_since_last_cb_ms=%lld\n",
-           (unsigned long long)(wait_ns / 1000000ull), (long long)idle_ms);
+   /* Both deltas cover the same interval on their own clock: the GPU's (from AMDGPU_INFO_TIMESTAMP)
+    * against the host's. They should agree; a constant ratio between them is the timestamp period
+    * being off, which would also scale the emulator's GPU-busy figures. */
+   const int64_t gpu_adv_ms = gpu_ns > lat_pre.gpu_ns ? (int64_t)((gpu_ns - lat_pre.gpu_ns) / 1000000ull) : -1;
+   const int64_t host_adv_ms = (int64_t)((os_time_get_nano() - lat_pre.host_ns) / 1000000ull);
+
+   /* cb_retired_during_wait is the whole test: 1 means the GPU finished a command buffer while the
+    * application was blocked in this wait, so the wait was GPU execution; 0 means nothing retired
+    * while it blocked, whatever the stamped busy time says. No clock comparison, no unit. */
+   fprintf(stderr, "radv: xclipse: latency wait_ms=%llu cb_retired_during_wait=%s cb_ticks_advanced=%llu "
+                   "gpu_clock_advanced_ms=%lld host_advanced_ms=%lld\n",
+           (unsigned long long)(wait_ns / 1000000ull), !lat_pre.ticks ? "none-yet" : retired ? "yes" : "no",
+           (unsigned long long)(ticks_now - lat_pre.ticks), (long long)gpu_adv_ms, (long long)host_adv_ms);
 }
 
 void
