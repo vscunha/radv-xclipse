@@ -373,13 +373,20 @@ radv_xclipse_diag_submit(uint32_t ip_type, uint32_t cmd_buffers, uint32_t genera
  * at each long fence wait, reports whether that value moved while the application was blocked (the
  * GPU retiring work during the wait) and which threads burned the CPU meanwhile. */
 
+#define XLAT_SLOTS 128
+
 static struct {
    struct radeon_winsys *ws;
    struct radeon_winsys_bo *bo;
-   volatile uint64_t *map; /* one 64-bit CP timestamp, the last command buffer to finish writes it */
+   volatile uint64_t *map; /* XLAT_SLOTS CP timestamps, one slot per stamped command buffer */
    uint64_t va;
    bool failed;
 } xlat;
+
+/* Which command buffer wrote each slot, host side: a retirement seen in a slot can then be placed in
+ * the submit order instead of being an anonymous change. */
+static uint64_t xlat_slot_cb[XLAT_SLOTS];
+static uint64_t xlat_cb_stamped;
 
 static bool
 xclipse_latency_enabled(void)
@@ -427,11 +434,14 @@ radv_xclipse_latency_cb_end(struct radv_cmd_buffer *cmd_buffer)
       *xlat.map = 0;
    }
 
-   /* Same packet a timestamp query uses; the last command buffer to finish owns the slot. Reserved
-    * like radv's own query path reserves for it, or the release build writes past max_dw. */
+   /* Same packet a timestamp query uses, in this command buffer's own slot, so a wait can count how
+    * many buffers retired during it instead of only noticing that one did. Reserved like radv's own
+    * query path reserves for it, or the release build writes past max_dw. */
+   const uint64_t slot = xlat_cb_stamped++ % XLAT_SLOTS;
+   xlat_slot_cb[slot] = xlat_cb_stamped;
    radeon_check_space(device->ws, cmd_buffer->cs->b, 32);
    radv_cs_add_buffer(device->ws, cmd_buffer->cs->b, xlat.bo);
-   radv_write_timestamp(cmd_buffer, xlat.va, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT);
+   radv_write_timestamp(cmd_buffer, xlat.va + slot * 8, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT);
 }
 
 /* ---- per-thread CPU accounting (RADV_XCLIPSE_LATENCY) --------------------------------------- */
@@ -475,16 +485,11 @@ static bool xlat_win_have;
 
 static struct {
    bool armed;
-   uint64_t ticks;
+   uint64_t slots[XLAT_SLOTS];
+   uint64_t cb_stamped;
    uint64_t host_ns;
    uint64_t proc_ns;
 } xlat_wait = {0};
-
-static struct {
-   uint64_t ticks;
-   uint64_t host_ns;
-   uint64_t proc_ns;
-} xlat_wait_result;
 
 static uint64_t
 xclipse_tick_ns(void)
@@ -685,7 +690,9 @@ radv_xclipse_native_trace_fence_wait_begin(uint32_t fence_count, uint32_t wait_a
       xlat_overlaps++;
       return;
    }
-   xlat_wait.ticks = *xlat.map;
+   for (unsigned i = 0; i < XLAT_SLOTS; i++)
+      xlat_wait.slots[i] = xlat.map[i];
+   xlat_wait.cb_stamped = xlat_cb_stamped;
    xlat_wait.host_ns = os_time_get_nano();
    xlat_wait.proc_ns = xclipse_proc_cpu_ns();
    xclipse_snapshot_threads(&xlat_wait_pre);
@@ -704,14 +711,25 @@ radv_xclipse_latency_wait(uint64_t wait_ns)
       return;
    }
 
-   const uint64_t ticks_now = *xlat.map;
    /* Not a wall clock on this platform: this shim returns the raw CP tick count although the UAPI
     * says nanoseconds (measured over one wait: 14.28M ticks against 13M "ns", ratio 1.06; the CP
     * clock works out at 26.18 MHz against a declared 25.6). Printed as ticks so nobody scales it. */
    const uint64_t ioctl_ticks = xlat.ws->query_value(xlat.ws, RADEON_TIMESTAMP);
-   /* An unchanged slot means no command buffer retired during the wait; a zero one means none ever
-    * did, which is reported as "no answer" rather than as "the GPU was idle". */
-   const bool retired = xlat_wait.ticks != 0 && ticks_now != xlat_wait.ticks;
+
+   /* Count the command buffers that retired while the application was blocked here: their slots
+    * changed. This is the difference between "the GPU was idle for half a second" and "the GPU was
+    * retiring buffers, one every so often"; a wait long enough to wrap all 128 slots undercounts. */
+   unsigned cbs_retired = 0;
+   unsigned stamped_before = 0;
+   for (unsigned i = 0; i < XLAT_SLOTS; i++) {
+      const uint64_t now_ticks = xlat.map[i];
+      if (!xlat_wait.slots[i])
+         continue;
+      stamped_before++;
+      if (now_ticks != xlat_wait.slots[i])
+         cbs_retired++;
+   }
+   const bool retired = cbs_retired != 0;
 
    const uint64_t now = os_time_get_nano();
    const int64_t host_adv_ms = (int64_t)((now - xlat_wait.host_ns) / 1000000ull);
@@ -732,10 +750,11 @@ radv_xclipse_latency_wait(uint64_t wait_ns)
    xclipse_format_top(list, sizeof(list), top, n);
 
    fprintf(stderr,
-           "radv: xclipse: latency wait_ms=%llu cb_retired_during_wait=%s cb_ticks_advanced=%llu host_advanced_ms=%lld "
-           "proc_cpu_ms=%lld acct=%d%% threads=%u%s ioctl_ticks=%llu top5=[%s]\n",
-           (unsigned long long)(wait_ns / 1000000ull), !xlat_wait.ticks ? "none-yet" : retired ? "yes" : "no",
-           (unsigned long long)(ticks_now - xlat_wait.ticks), (long long)host_adv_ms, (long long)proc_cpu_ms, acct,
+           "radv: xclipse: latency wait_ms=%llu cbs_retired_during_wait=%u of %u cb_retired=%s "
+           "cb_stamped=%llu host_advanced_ms=%lld proc_cpu_ms=%lld acct=%d%% threads=%u%s ioctl_ticks=%llu top5=[%s]\n",
+           (unsigned long long)(wait_ns / 1000000ull), cbs_retired, stamped_before,
+           !stamped_before ? "none-yet" : retired ? "yes" : "no", (unsigned long long)xlat_wait.cb_stamped,
+           (long long)host_adv_ms, (long long)proc_cpu_ms, acct,
            xlat_wait_now.n, xlat_wait_now.truncated ? "(truncated)" : "", (unsigned long long)ioctl_ticks, list);
 
    pthread_mutex_unlock(&xlat_mu);
