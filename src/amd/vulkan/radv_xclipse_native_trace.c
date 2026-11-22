@@ -20,6 +20,10 @@
 #include "radv_device.h"
 #include "radv_physical_device.h"
 #include "radv_radeon_winsys.h"
+#include <dirent.h>
+#include <fcntl.h>
+#include <unistd.h>
+
 #include "radv_query.h"
 #include "radv_shader.h"
 #include "radv_xclipse_mesh_diag.h"
@@ -426,12 +430,94 @@ radv_xclipse_latency_cb_end(struct radv_cmd_buffer *cmd_buffer)
 }
 
 /* Sampled around the wait, so the test needs no epoch and no unit: the same counter read twice. */
+#define XLAT_MAX_THREADS 48
+
+struct xlat_thread_cpu {
+   int tid;
+   uint64_t cpu_ns;
+};
+
 static struct {
    uint64_t ticks;
    uint64_t host_ns;
    uint64_t proc_cpu_ns;
    bool armed;
+   unsigned n_threads;
+   struct xlat_thread_cpu threads[XLAT_MAX_THREADS];
 } lat_pre;
+
+/* Per-thread CPU of this process, read from /proc/self/task/<tid>/stat. Process-wide CPU time says
+ * the work exists; only the per-thread figures say which thread is doing it, and its comm usually
+ * names the subsystem. */
+static unsigned
+xclipse_snapshot_threads(struct xlat_thread_cpu *out, unsigned max)
+{
+   DIR *dir = opendir("/proc/self/task");
+   if (!dir)
+      return 0;
+
+   unsigned n = 0;
+   const struct dirent *de;
+   while (n < max && (de = readdir(dir))) {
+      const int tid = atoi(de->d_name);
+      if (tid <= 0)
+         continue;
+      char path[64], buf[512];
+      snprintf(path, sizeof(path), "/proc/self/task/%d/stat", tid);
+      const int fd = open(path, O_RDONLY);
+      if (fd < 0)
+         continue;
+      const ssize_t got = read(fd, buf, sizeof(buf) - 1);
+      close(fd);
+      if (got <= 0)
+         continue;
+      buf[got] = 0;
+      const char *tail = strrchr(buf, ')');
+      if (!tail)
+         continue;
+      /* Fields after comm: state is the first token, utime and stime are 12 and 13 tokens in. */
+      const char *tok = tail + 2;
+      unsigned long utime = 0, stime = 0;
+      for (int i = 0; i < 13 && tok && *tok; i++) {
+         if (i == 11 || i == 12) {
+            unsigned long v = strtoul(tok, NULL, 10);
+            if (i == 11)
+               utime = v;
+            else
+               stime = v;
+         }
+         tok = strchr(tok, ' ');
+         if (tok)
+            tok++;
+      }
+      out[n].tid = tid;
+      out[n].cpu_ns = (uint64_t)(utime + stime) * 10000000ull; /* USER_HZ assumed 100 */
+      n++;
+   }
+   closedir(dir);
+   return n;
+}
+
+static void
+xclipse_thread_name(int tid, char *dst, size_t size)
+{
+   char path[64];
+   snprintf(path, sizeof(path), "/proc/self/task/%d/comm", tid);
+   const int fd = open(path, O_RDONLY);
+   dst[0] = 0;
+   if (fd < 0)
+      return;
+   const ssize_t got = read(fd, dst, size - 1);
+   close(fd);
+   if (got <= 0) {
+      dst[0] = 0;
+      return;
+   }
+   dst[got] = 0;
+   char *nl = strchr(dst, '\n');
+   if (nl)
+      *nl = 0;
+}
 
 static uint64_t
 xclipse_proc_cpu_ns(void)
@@ -453,6 +539,7 @@ radv_xclipse_native_trace_fence_wait_begin(uint32_t fence_count, uint32_t wait_a
    lat_pre.ticks = *xlat.map;
    lat_pre.host_ns = os_time_get_nano();
    lat_pre.proc_cpu_ns = xclipse_proc_cpu_ns();
+   lat_pre.n_threads = xclipse_snapshot_threads(lat_pre.threads, XLAT_MAX_THREADS);
    lat_pre.armed = true;
 }
 
@@ -486,11 +573,46 @@ radv_xclipse_latency_wait(uint64_t wait_ns)
    /* cb_retired_during_wait is the whole test: 1 means the GPU finished a command buffer while the
     * application was blocked in this wait, so the wait was GPU execution; 0 means nothing retired
     * while it blocked, whatever the stamped busy time says. No clock comparison, no unit. */
+   /* Which threads burned that CPU. Two largest deltas, by comm, so the line names the subsystem
+    * instead of leaving the work anonymous. */
+   struct xlat_thread_cpu now[XLAT_MAX_THREADS];
+   const unsigned n_now = lat_pre.n_threads ? xclipse_snapshot_threads(now, XLAT_MAX_THREADS) : 0;
+   char busiest_a[40] = "", busiest_b[40] = "";
+   long long busiest_a_ms = -1, busiest_b_ms = -1;
+   for (unsigned i = 0; n_now && i < lat_pre.n_threads; i++) {
+      uint64_t after = 0;
+      bool found = false;
+      for (unsigned j = 0; j < n_now; j++) {
+         if (now[j].tid == lat_pre.threads[i].tid) {
+            after = now[j].cpu_ns;
+            found = true;
+            break;
+         }
+      }
+      if (!found || after < lat_pre.threads[i].cpu_ns)
+         continue;
+      const long long delta_ms = (long long)((after - lat_pre.threads[i].cpu_ns) / 1000000ull);
+      if (delta_ms <= 0)
+         continue;
+      char name[40] = "";
+      xclipse_thread_name(lat_pre.threads[i].tid, name, sizeof(name));
+      if (delta_ms > busiest_a_ms) {
+         busiest_b_ms = busiest_a_ms;
+         memcpy(busiest_b, busiest_a, sizeof(busiest_b));
+         busiest_a_ms = delta_ms;
+         snprintf(busiest_a, sizeof(busiest_a), "%s", name);
+      } else if (delta_ms > busiest_b_ms) {
+         busiest_b_ms = delta_ms;
+         snprintf(busiest_b, sizeof(busiest_b), "%s", name);
+      }
+   }
+
    fprintf(stderr, "radv: xclipse: latency wait_ms=%llu cb_retired_during_wait=%s cb_ticks_advanced=%llu "
-                   "host_advanced_ms=%lld proc_cpu_ms=%lld ioctl_ticks=%llu\n",
+                   "host_advanced_ms=%lld proc_cpu_ms=%lld ioctl_ticks=%llu top1=%s:%lld top2=%s:%lld\n",
            (unsigned long long)(wait_ns / 1000000ull), !lat_pre.ticks ? "none-yet" : retired ? "yes" : "no",
            (unsigned long long)(ticks_now - lat_pre.ticks), (long long)host_adv_ms, (long long)proc_cpu_ms,
-           (unsigned long long)ioctl_ticks);
+           (unsigned long long)ioctl_ticks, busiest_a[0] ? busiest_a : "-", busiest_a_ms,
+           busiest_b[0] ? busiest_b : "-", busiest_b_ms);
 }
 
 void
