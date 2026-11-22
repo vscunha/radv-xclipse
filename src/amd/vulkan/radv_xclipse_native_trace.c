@@ -21,6 +21,7 @@
 #include "radv_physical_device.h"
 #include "radv_radeon_winsys.h"
 #include <dirent.h>
+#include <pthread.h>
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -364,14 +365,19 @@ radv_xclipse_diag_submit(uint32_t ip_type, uint32_t cmd_buffers, uint32_t genera
    xd_reports++;
 }
 
-/* ---- GPU-side end-of-submission clock ------------------------------------------------------- */
+
+/* ---- GPU-side end-of-submission clock + CPU attribution (RADV_XCLIPSE_LATENCY, default off) ---- */
+
+/* The emulator's GPU-busy figures come from CP timestamps, so they can only say how long the parts
+ * it stamped took. This writes one bottom-of-pipe timestamp at the end of every command buffer and,
+ * at each long fence wait, reports whether that value moved while the application was blocked (the
+ * GPU retiring work during the wait) and which threads burned the CPU meanwhile. */
 
 static struct {
    struct radeon_winsys *ws;
    struct radeon_winsys_bo *bo;
    volatile uint64_t *map; /* one 64-bit CP timestamp, the last command buffer to finish writes it */
    uint64_t va;
-   double ns_per_tick;
    bool failed;
 } xlat;
 
@@ -383,23 +389,23 @@ xclipse_latency_enabled(void)
       const char *e = getenv("RADV_XCLIPSE_LATENCY");
       cached = e && *e ? atoi(e) : 0;
       if (cached)
-         fprintf(stderr, "radv: xclipse: latency %d: a bottom-of-pipe timestamp at the end of every command "
-                         "buffer, read beside the GPU clock at every fence wait over 100 ms\n", cached);
+         fprintf(stderr, "radv: xclipse: latency %d: bottom-of-pipe timestamp per command buffer, per-wait and "
+                         "per-window thread CPU\n", cached);
    }
    return cached != 0;
 }
 
+static void xclipse_thread_cpu_window(void);
+
 void
 radv_xclipse_latency_cb_end(struct radv_cmd_buffer *cmd_buffer)
 {
+   xclipse_thread_cpu_window();
    if (!xclipse_latency_enabled() || xlat.failed)
       return;
 
    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
    struct radeon_winsys *ws = device->ws;
-
-   /* The timestamp event is a graphics/compute packet: a transfer or video command buffer would get
-    * it in an IB the IP cannot execute (radv's own CmdWriteTimestamp2 guards the same way). */
    if (cmd_buffer->qf != RADV_QUEUE_GENERAL && cmd_buffer->qf != RADV_QUEUE_COMPUTE)
       return;
 
@@ -414,7 +420,6 @@ radv_xclipse_latency_cb_end(struct radv_cmd_buffer *cmd_buffer)
       xlat.ws = ws;
       xlat.map = ws->buffer_map(ws, xlat.bo, false, NULL);
       xlat.va = radv_buffer_get_va(xlat.bo);
-      xlat.ns_per_tick = 1000000.0 / radv_device_physical(device)->info.clock_crystal_freq;
       if (!xlat.map) {
          xlat.failed = true;
          return;
@@ -429,94 +434,66 @@ radv_xclipse_latency_cb_end(struct radv_cmd_buffer *cmd_buffer)
    radv_write_timestamp(cmd_buffer, xlat.va, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT);
 }
 
-/* Sampled around the wait, so the test needs no epoch and no unit: the same counter read twice. */
-#define XLAT_MAX_THREADS 48
+/* ---- per-thread CPU accounting (RADV_XCLIPSE_LATENCY) --------------------------------------- */
 
-struct xlat_thread_cpu {
+/* The question this answers is attribution, not magnitude: during a fence wait that blocks the
+ * application thread, and over ordinary rendering windows, which threads of this process are
+ * consuming CPU, and how much of the process total do they account for. Tick period comes from the
+ * C library rather than an assumed USER_HZ, every thread is enumerated with an explicit truncation
+ * flag, and the measured per-thread sum is compared against CLOCK_PROCESS_CPUTIME_ID so a missing
+ * account is visible instead of silent. Nothing here runs unless the knob is on. */
+
+#define XLAT_THREADS_MAX 512
+
+struct xlat_thread {
    int tid;
    uint64_t cpu_ns;
+   char comm[24];
 };
+
+struct xlat_snap {
+   unsigned n;
+   bool truncated;
+   struct xlat_thread t[XLAT_THREADS_MAX];
+};
+
+struct xlat_top {
+   long long cpu_ms;
+   int tid;
+   char comm[24];
+};
+
+static pthread_mutex_t xlat_mu = PTHREAD_MUTEX_INITIALIZER; /* serialises the wait path */
+static pthread_mutex_t xlat_win_mu = PTHREAD_MUTEX_INITIALIZER;
+static unsigned xlat_overlaps;
+static uint64_t xlat_tick_ns; /* nanoseconds per clock tick, from sysconf(_SC_CLK_TCK) */
+
+static struct xlat_snap xlat_win_pre, xlat_win_now;
+static struct xlat_snap xlat_wait_pre, xlat_wait_now;
+static uint64_t xlat_win_start_ns, xlat_win_pre_proc_ns;
+static bool xlat_win_have;
+
+static struct {
+   bool armed;
+   uint64_t ticks;
+   uint64_t host_ns;
+   uint64_t proc_ns;
+} xlat_wait = {0};
 
 static struct {
    uint64_t ticks;
    uint64_t host_ns;
-   uint64_t proc_cpu_ns;
-   bool armed;
-   unsigned n_threads;
-   struct xlat_thread_cpu threads[XLAT_MAX_THREADS];
-} lat_pre;
+   uint64_t proc_ns;
+} xlat_wait_result;
 
-/* Per-thread CPU of this process, read from /proc/self/task/<tid>/stat. Process-wide CPU time says
- * the work exists; only the per-thread figures say which thread is doing it, and its comm usually
- * names the subsystem. */
-static unsigned
-xclipse_snapshot_threads(struct xlat_thread_cpu *out, unsigned max)
+static uint64_t
+xclipse_tick_ns(void)
 {
-   DIR *dir = opendir("/proc/self/task");
-   if (!dir)
-      return 0;
-
-   unsigned n = 0;
-   const struct dirent *de;
-   while (n < max && (de = readdir(dir))) {
-      const int tid = atoi(de->d_name);
-      if (tid <= 0)
-         continue;
-      char path[64], buf[512];
-      snprintf(path, sizeof(path), "/proc/self/task/%d/stat", tid);
-      const int fd = open(path, O_RDONLY);
-      if (fd < 0)
-         continue;
-      const ssize_t got = read(fd, buf, sizeof(buf) - 1);
-      close(fd);
-      if (got <= 0)
-         continue;
-      buf[got] = 0;
-      const char *tail = strrchr(buf, ')');
-      if (!tail)
-         continue;
-      /* Fields after comm: state is the first token, utime and stime are 12 and 13 tokens in. */
-      const char *tok = tail + 2;
-      unsigned long utime = 0, stime = 0;
-      for (int i = 0; i < 13 && tok && *tok; i++) {
-         if (i == 11 || i == 12) {
-            unsigned long v = strtoul(tok, NULL, 10);
-            if (i == 11)
-               utime = v;
-            else
-               stime = v;
-         }
-         tok = strchr(tok, ' ');
-         if (tok)
-            tok++;
-      }
-      out[n].tid = tid;
-      out[n].cpu_ns = (uint64_t)(utime + stime) * 10000000ull; /* USER_HZ assumed 100 */
-      n++;
+   if (!xlat_tick_ns) {
+      const long hz = sysconf(_SC_CLK_TCK);
+      xlat_tick_ns = hz > 0 ? 1000000000ull / (uint64_t)hz : 10000000ull;
    }
-   closedir(dir);
-   return n;
-}
-
-static void
-xclipse_thread_name(int tid, char *dst, size_t size)
-{
-   char path[64];
-   snprintf(path, sizeof(path), "/proc/self/task/%d/comm", tid);
-   const int fd = open(path, O_RDONLY);
-   dst[0] = 0;
-   if (fd < 0)
-      return;
-   const ssize_t got = read(fd, dst, size - 1);
-   close(fd);
-   if (got <= 0) {
-      dst[0] = 0;
-      return;
-   }
-   dst[got] = 0;
-   char *nl = strchr(dst, '\n');
-   if (nl)
-      *nl = 0;
+   return xlat_tick_ns;
 }
 
 static uint64_t
@@ -528,91 +505,240 @@ xclipse_proc_cpu_ns(void)
    return (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
 }
 
+/* Reads every thread under /proc/self/task. comm comes from the same directory entry read, so no
+ * second syscall per thread and no stale cache. */
+static unsigned
+xclipse_snapshot_threads(struct xlat_snap *s)
+{
+   DIR *dir = opendir("/proc/self/task");
+   s->n = 0;
+   s->truncated = false;
+   if (!dir)
+      return 0;
+
+   const uint64_t tick_ns = xclipse_tick_ns();
+   const struct dirent *de;
+   while ((de = readdir(dir))) {
+      const int tid = atoi(de->d_name);
+      if (tid <= 0)
+         continue;
+      if (s->n == XLAT_THREADS_MAX) {
+         s->truncated = true;
+         break;
+      }
+
+      char path[64], buf[512];
+      snprintf(path, sizeof(path), "/proc/self/task/%d/stat", tid);
+      const int fd = open(path, O_RDONLY);
+      if (fd < 0)
+         continue;
+      const ssize_t got = read(fd, buf, sizeof(buf) - 1);
+      close(fd);
+      if (got <= 0)
+         continue;
+      buf[got] = 0;
+
+      struct xlat_thread *t = &s->t[s->n];
+      t->tid = tid;
+      t->comm[0] = 0;
+      snprintf(path, sizeof(path), "/proc/self/task/%d/comm", tid);
+      const int cfd = open(path, O_RDONLY);
+      if (cfd >= 0) {
+         const ssize_t cgot = read(cfd, t->comm, sizeof(t->comm) - 1);
+         close(cfd);
+         if (cgot > 0) {
+            t->comm[cgot] = 0;
+            char *nl = strchr(t->comm, '\n');
+            if (nl)
+               *nl = 0;
+         } else {
+            t->comm[0] = 0;
+         }
+      }
+
+      /* Fields after ") ": state is field 3, so utime and stime are fields 14 and 15 counted from 1
+       * in proc(5), which is what the loop counter is, avoiding an off-by-one on a shifting token. */
+      const char *tail = strrchr(buf, ')');
+      if (!tail)
+         continue;
+      const char *q = tail + 1;
+      unsigned long utime = 0, stime = 0;
+      for (int f = 3; f <= 15 && q && *q; f++) {
+         while (*q == ' ')
+            q++;
+         if (f == 14)
+            utime = strtoul(q, NULL, 10);
+         else if (f == 15)
+            stime = strtoul(q, NULL, 10);
+         q = strchr(q, ' ');
+         if (!q)
+            break;
+      }
+      t->cpu_ns = (uint64_t)(utime + stime) * tick_ns;
+      s->n++;
+   }
+   closedir(dir);
+   return s->n;
+}
+
+/* Deltas between two snapshots, largest first, plus how much of the process total they explain. */
+static unsigned
+xclipse_top_deltas(const struct xlat_snap *before, const struct xlat_snap *after, uint64_t proc_delta_ns,
+                   struct xlat_top *out, unsigned want, uint64_t *sum_delta_ns)
+{
+   unsigned n = 0;
+   uint64_t sum = 0;
+   for (unsigned i = 0; i < after->n; i++) {
+      const struct xlat_thread *a = &after->t[i];
+      const struct xlat_thread *b = NULL;
+      for (unsigned j = 0; j < before->n; j++) {
+         if (before->t[j].tid == a->tid) {
+            b = &before->t[j];
+            break;
+         }
+      }
+      if (!b || a->cpu_ns < b->cpu_ns)
+         continue; /* a new thread, or a tid reused with a smaller counter: not attributable */
+      const uint64_t d = a->cpu_ns - b->cpu_ns;
+      sum += d;
+      if (!d)
+         continue;
+      /* keep the list sorted, largest first, at most `want` entries */
+      unsigned pos = n;
+      while (pos > 0 && out[pos - 1].cpu_ms < (long long)(d / 1000000ull))
+         pos--;
+      if (pos >= want)
+         continue;
+      if (n < want)
+         n++;
+      for (unsigned k = n - 1; k > pos; k--)
+         out[k] = out[k - 1];
+      out[pos].cpu_ms = (long long)(d / 1000000ull);
+      out[pos].tid = a->tid;
+      memcpy(out[pos].comm, a->comm, sizeof(out[pos].comm));
+   }
+   *sum_delta_ns = sum;
+   return n;
+}
+
+static void
+xclipse_format_top(char *dst, size_t size, const struct xlat_top *top, unsigned n)
+{
+   size_t off = 0;
+   dst[0] = 0;
+   for (unsigned i = 0; i < n && off + 1 < size; i++) {
+      const int w = snprintf(dst + off, size - off, "%s%s/%d:%lld", i ? ";" : "", top[i].comm[0] ? top[i].comm : "?",
+                             top[i].tid, top[i].cpu_ms);
+      if (w <= 0)
+         break;
+      off += (size_t)w;
+   }
+}
+
+/* Ordinary rendering windows, so the mesh-off configuration produces data at all: it has almost no
+ * long waits. Cheap when nothing is due (one clock read per command buffer end). */
+static void
+xclipse_thread_cpu_window(void)
+{
+   if (!xclipse_latency_enabled())
+      return;
+
+   const uint64_t now = os_time_get_nano();
+   if (xlat_win_have && now - xlat_win_start_ns < 2000000000ull)
+      return;
+   if (pthread_mutex_trylock(&xlat_win_mu) != 0)
+      return;
+
+   if (xclipse_snapshot_threads(&xlat_win_now)) {
+      const uint64_t proc = xclipse_proc_cpu_ns();
+      if (xlat_win_have) {
+         struct xlat_top top[5];
+         uint64_t sum = 0;
+         const unsigned n = xclipse_top_deltas(&xlat_win_pre, &xlat_win_now, proc - xlat_win_pre_proc_ns, top, 5, &sum);
+         char list[256];
+         xclipse_format_top(list, sizeof(list), top, n);
+         const uint64_t proc_delta = proc - xlat_win_pre_proc_ns;
+         fprintf(stderr,
+                 "radv: xclipse: threadcpu window_ms=%llu threads=%u%s proc_cpu_ms=%llu acct=%d%% top5=[%s]\n",
+                 (unsigned long long)((now - xlat_win_start_ns) / 1000000ull), xlat_win_now.n,
+                 xlat_win_now.truncated ? "(truncated)" : "", (unsigned long long)(proc_delta / 1000000ull),
+                 proc_delta ? (int)(sum * 100ull / proc_delta) : -1, list);
+      }
+      xlat_win_pre = xlat_win_now;
+      xlat_win_start_ns = now;
+      xlat_win_pre_proc_ns = proc;
+      xlat_win_have = true;
+   }
+   pthread_mutex_unlock(&xlat_win_mu);
+}
+/* Sampled around the wait, so the GPU-clock test needs no epoch and no unit: the same counter read
+ * twice. The mutex is held across the pair, so overlapping waits are skipped and counted rather than
+ * interleaved. */
 void
 radv_xclipse_native_trace_fence_wait_begin(uint32_t fence_count, uint32_t wait_all)
 {
    (void)fence_count;
    (void)wait_all;
-   lat_pre.armed = false;
    if (!xclipse_latency_enabled() || xlat.failed || !xlat.map || !xlat.ws)
       return;
-   lat_pre.ticks = *xlat.map;
-   lat_pre.host_ns = os_time_get_nano();
-   lat_pre.proc_cpu_ns = xclipse_proc_cpu_ns();
-   lat_pre.n_threads = xclipse_snapshot_threads(lat_pre.threads, XLAT_MAX_THREADS);
-   lat_pre.armed = true;
+   if (pthread_mutex_trylock(&xlat_mu) != 0) {
+      xlat_overlaps++;
+      return;
+   }
+   xlat_wait.ticks = *xlat.map;
+   xlat_wait.host_ns = os_time_get_nano();
+   xlat_wait.proc_ns = xclipse_proc_cpu_ns();
+   xclipse_snapshot_threads(&xlat_wait_pre);
+   xlat_wait.armed = true;
 }
 
 void
 radv_xclipse_latency_wait(uint64_t wait_ns)
 {
-   if (!xclipse_latency_enabled() || xlat.failed || !xlat.map || !xlat.ws || wait_ns < 100000000ull)
+   if (!xlat_wait.armed)
       return;
-   if (!lat_pre.armed)
+   xlat_wait.armed = false;
+
+   if (!xclipse_latency_enabled() || xlat.failed || !xlat.map || !xlat.ws || wait_ns < 100000000ull) {
+      pthread_mutex_unlock(&xlat_mu);
       return;
-   lat_pre.armed = false;
+   }
 
    const uint64_t ticks_now = *xlat.map;
-   /* Not a wall clock on this platform: the value advances about as fast as the command buffer
-    * timestamps themselves, i.e. this shim returns the raw CP tick count although the UAPI says
-    * nanoseconds (measured over one wait: 14.28M ticks against 13M "ns", ratio 1.06; the CP clock
-    * works out at 26.18 MHz against a declared 25.6). Printed as raw ticks so nobody scales it. */
+   /* Not a wall clock on this platform: this shim returns the raw CP tick count although the UAPI
+    * says nanoseconds (measured over one wait: 14.28M ticks against 13M "ns", ratio 1.06; the CP
+    * clock works out at 26.18 MHz against a declared 25.6). Printed as ticks so nobody scales it. */
    const uint64_t ioctl_ticks = xlat.ws->query_value(xlat.ws, RADEON_TIMESTAMP);
    /* An unchanged slot means no command buffer retired during the wait; a zero one means none ever
     * did, which is reported as "no answer" rather than as "the GPU was idle". */
-   const bool retired = lat_pre.ticks != 0 && ticks_now != lat_pre.ticks;
+   const bool retired = xlat_wait.ticks != 0 && ticks_now != xlat_wait.ticks;
 
-   const int64_t host_adv_ms = (int64_t)((os_time_get_nano() - lat_pre.host_ns) / 1000000ull);
-   /* CPU time this process burned while the application thread was blocked here. This is the one
-    * figure in the line that needs no clock semantics: if it is close to host_adv_ms the "wait" was
-    * this process computing on some other thread, and the bottleneck is host work; if it is near
-    * zero the process really was idle, waiting for a signal. */
+   const uint64_t now = os_time_get_nano();
+   const int64_t host_adv_ms = (int64_t)((now - xlat_wait.host_ns) / 1000000ull);
    const uint64_t now_cpu = xclipse_proc_cpu_ns();
-   const int64_t proc_cpu_ms = (now_cpu && lat_pre.proc_cpu_ns) ? (int64_t)((now_cpu - lat_pre.proc_cpu_ns) / 1000000ull) : -1;
+   const uint64_t proc_delta = (now_cpu && xlat_wait.proc_ns && now_cpu > xlat_wait.proc_ns) ? now_cpu - xlat_wait.proc_ns : 0;
+   const int64_t proc_cpu_ms = proc_delta ? (int64_t)(proc_delta / 1000000ull) : -1;
 
-   /* cb_retired_during_wait is the whole test: 1 means the GPU finished a command buffer while the
-    * application was blocked in this wait, so the wait was GPU execution; 0 means nothing retired
-    * while it blocked, whatever the stamped busy time says. No clock comparison, no unit. */
-   /* Which threads burned that CPU. Two largest deltas, by comm, so the line names the subsystem
-    * instead of leaving the work anonymous. */
-   struct xlat_thread_cpu now[XLAT_MAX_THREADS];
-   const unsigned n_now = lat_pre.n_threads ? xclipse_snapshot_threads(now, XLAT_MAX_THREADS) : 0;
-   char busiest_a[40] = "", busiest_b[40] = "";
-   long long busiest_a_ms = -1, busiest_b_ms = -1;
-   for (unsigned i = 0; n_now && i < lat_pre.n_threads; i++) {
-      uint64_t after = 0;
-      bool found = false;
-      for (unsigned j = 0; j < n_now; j++) {
-         if (now[j].tid == lat_pre.threads[i].tid) {
-            after = now[j].cpu_ns;
-            found = true;
-            break;
-         }
-      }
-      if (!found || after < lat_pre.threads[i].cpu_ns)
-         continue;
-      const long long delta_ms = (long long)((after - lat_pre.threads[i].cpu_ns) / 1000000ull);
-      if (delta_ms <= 0)
-         continue;
-      char name[40] = "";
-      xclipse_thread_name(lat_pre.threads[i].tid, name, sizeof(name));
-      if (delta_ms > busiest_a_ms) {
-         busiest_b_ms = busiest_a_ms;
-         memcpy(busiest_b, busiest_a, sizeof(busiest_b));
-         busiest_a_ms = delta_ms;
-         snprintf(busiest_a, sizeof(busiest_a), "%s", name);
-      } else if (delta_ms > busiest_b_ms) {
-         busiest_b_ms = delta_ms;
-         snprintf(busiest_b, sizeof(busiest_b), "%s", name);
-      }
+   struct xlat_top top[5];
+   uint64_t sum = 0;
+   unsigned n = 0;
+   int acct = -1;
+   if (xclipse_snapshot_threads(&xlat_wait_now)) {
+      n = xclipse_top_deltas(&xlat_wait_pre, &xlat_wait_now, proc_delta, top, 5, &sum);
+      if (proc_delta)
+         acct = (int)(sum * 100ull / proc_delta);
    }
+   char list[320];
+   xclipse_format_top(list, sizeof(list), top, n);
 
-   fprintf(stderr, "radv: xclipse: latency wait_ms=%llu cb_retired_during_wait=%s cb_ticks_advanced=%llu "
-                   "host_advanced_ms=%lld proc_cpu_ms=%lld ioctl_ticks=%llu top1=%s:%lld top2=%s:%lld\n",
-           (unsigned long long)(wait_ns / 1000000ull), !lat_pre.ticks ? "none-yet" : retired ? "yes" : "no",
-           (unsigned long long)(ticks_now - lat_pre.ticks), (long long)host_adv_ms, (long long)proc_cpu_ms,
-           (unsigned long long)ioctl_ticks, busiest_a[0] ? busiest_a : "-", busiest_a_ms,
-           busiest_b[0] ? busiest_b : "-", busiest_b_ms);
+   fprintf(stderr,
+           "radv: xclipse: latency wait_ms=%llu cb_retired_during_wait=%s cb_ticks_advanced=%llu host_advanced_ms=%lld "
+           "proc_cpu_ms=%lld acct=%d%% threads=%u%s ioctl_ticks=%llu top5=[%s]\n",
+           (unsigned long long)(wait_ns / 1000000ull), !xlat_wait.ticks ? "none-yet" : retired ? "yes" : "no",
+           (unsigned long long)(ticks_now - xlat_wait.ticks), (long long)host_adv_ms, (long long)proc_cpu_ms, acct,
+           xlat_wait_now.n, xlat_wait_now.truncated ? "(truncated)" : "", (unsigned long long)ioctl_ticks, list);
+
+   pthread_mutex_unlock(&xlat_mu);
 }
 
 void
