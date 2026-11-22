@@ -428,10 +428,19 @@ radv_xclipse_latency_cb_end(struct radv_cmd_buffer *cmd_buffer)
 /* Sampled around the wait, so the test needs no epoch and no unit: the same counter read twice. */
 static struct {
    uint64_t ticks;
-   uint64_t gpu_ns;
    uint64_t host_ns;
+   uint64_t proc_cpu_ns;
    bool armed;
 } lat_pre;
+
+static uint64_t
+xclipse_proc_cpu_ns(void)
+{
+   struct timespec ts;
+   if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &ts) != 0)
+      return 0;
+   return (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
+}
 
 void
 radv_xclipse_native_trace_fence_wait_begin(uint32_t fence_count, uint32_t wait_all)
@@ -442,8 +451,8 @@ radv_xclipse_native_trace_fence_wait_begin(uint32_t fence_count, uint32_t wait_a
    if (!xclipse_latency_enabled() || xlat.failed || !xlat.map || !xlat.ws)
       return;
    lat_pre.ticks = *xlat.map;
-   lat_pre.gpu_ns = xlat.ws->query_value(xlat.ws, RADEON_TIMESTAMP);
    lat_pre.host_ns = os_time_get_nano();
+   lat_pre.proc_cpu_ns = xclipse_proc_cpu_ns();
    lat_pre.armed = true;
 }
 
@@ -457,24 +466,31 @@ radv_xclipse_latency_wait(uint64_t wait_ns)
    lat_pre.armed = false;
 
    const uint64_t ticks_now = *xlat.map;
-   const uint64_t gpu_ns = xlat.ws->query_value(xlat.ws, RADEON_TIMESTAMP);
+   /* Not a wall clock on this platform: the value advances about as fast as the command buffer
+    * timestamps themselves, i.e. this shim returns the raw CP tick count although the UAPI says
+    * nanoseconds (measured over one wait: 14.28M ticks against 13M "ns", ratio 1.06; the CP clock
+    * works out at 26.18 MHz against a declared 25.6). Printed as raw ticks so nobody scales it. */
+   const uint64_t ioctl_ticks = xlat.ws->query_value(xlat.ws, RADEON_TIMESTAMP);
    /* An unchanged slot means no command buffer retired during the wait; a zero one means none ever
     * did, which is reported as "no answer" rather than as "the GPU was idle". */
    const bool retired = lat_pre.ticks != 0 && ticks_now != lat_pre.ticks;
 
-   /* Both deltas cover the same interval on their own clock: the GPU's (from AMDGPU_INFO_TIMESTAMP)
-    * against the host's. They should agree; a constant ratio between them is the timestamp period
-    * being off, which would also scale the emulator's GPU-busy figures. */
-   const int64_t gpu_adv_ms = gpu_ns > lat_pre.gpu_ns ? (int64_t)((gpu_ns - lat_pre.gpu_ns) / 1000000ull) : -1;
    const int64_t host_adv_ms = (int64_t)((os_time_get_nano() - lat_pre.host_ns) / 1000000ull);
+   /* CPU time this process burned while the application thread was blocked here. This is the one
+    * figure in the line that needs no clock semantics: if it is close to host_adv_ms the "wait" was
+    * this process computing on some other thread, and the bottleneck is host work; if it is near
+    * zero the process really was idle, waiting for a signal. */
+   const uint64_t now_cpu = xclipse_proc_cpu_ns();
+   const int64_t proc_cpu_ms = (now_cpu && lat_pre.proc_cpu_ns) ? (int64_t)((now_cpu - lat_pre.proc_cpu_ns) / 1000000ull) : -1;
 
    /* cb_retired_during_wait is the whole test: 1 means the GPU finished a command buffer while the
     * application was blocked in this wait, so the wait was GPU execution; 0 means nothing retired
     * while it blocked, whatever the stamped busy time says. No clock comparison, no unit. */
    fprintf(stderr, "radv: xclipse: latency wait_ms=%llu cb_retired_during_wait=%s cb_ticks_advanced=%llu "
-                   "gpu_clock_advanced_ms=%lld host_advanced_ms=%lld\n",
+                   "host_advanced_ms=%lld proc_cpu_ms=%lld ioctl_ticks=%llu\n",
            (unsigned long long)(wait_ns / 1000000ull), !lat_pre.ticks ? "none-yet" : retired ? "yes" : "no",
-           (unsigned long long)(ticks_now - lat_pre.ticks), (long long)gpu_adv_ms, (long long)host_adv_ms);
+           (unsigned long long)(ticks_now - lat_pre.ticks), (long long)host_adv_ms, (long long)proc_cpu_ms,
+           (unsigned long long)ioctl_ticks);
 }
 
 void
