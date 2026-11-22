@@ -43,6 +43,8 @@
 void radv_xclipse_native_trace_fence_wait(const void *active_sync, uint32_t fence_count, uint32_t wait_all, int result,
                                           uint64_t wait_ns) __attribute__((weak));
 void radv_xclipse_native_trace_fence_wait_begin(uint32_t fence_count, uint32_t wait_all) __attribute__((weak));
+void radv_xclipse_phase_enter(bool is_wait) __attribute__((weak));
+void radv_xclipse_phase_exit(bool is_wait) __attribute__((weak));
 #endif
 
 static VkExternalFenceHandleTypeFlags
@@ -298,12 +300,16 @@ vk_common_WaitForFences(VkDevice _device,
     * during it (the GPU was executing) or none did (it was not). */
    if (radv_xclipse_native_trace_fence_wait_begin)
       radv_xclipse_native_trace_fence_wait_begin(fenceCount, waitAll);
+   if (radv_xclipse_phase_enter)
+      radv_xclipse_phase_enter(true);
 #endif
 
    VkResult result = vk_sync_wait_many(device, fenceCount, waits,
                                        wait_flags, abs_timeout_ns);
 
    const uint64_t wait_ns = os_time_get_nano() - wait_t0;
+   if (radv_xclipse_phase_exit)
+      radv_xclipse_phase_exit(true);
    if (xperf)
       vk_xclipse_perf_wait(wait_ns);
    if (xprof)

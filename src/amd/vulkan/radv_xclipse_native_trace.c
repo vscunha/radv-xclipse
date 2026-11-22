@@ -666,6 +666,10 @@ static struct xlat_snap xlat_win_pre, xlat_win_now;
  * the split decides whether the frame is spent on our side of the API boundary at all. */
 static uint64_t xlat_phase_submit_ns, xlat_phase_wait_ns;
 static uint64_t xlat_phase_submits, xlat_phase_waits;
+/* Accumulated call durations are per thread and can overlap in wall time, so their sum is not a
+ * partition of the window. Counting in-flight calls makes that visible instead of arithmetic. */
+static unsigned xlat_inflight_submit, xlat_inflight_wait;
+static unsigned xlat_overlap_submit, xlat_overlap_wait, xlat_inflight_max;
 static struct xlat_snap xlat_wait_pre, xlat_wait_now;
 static uint64_t xlat_win_start_ns, xlat_win_pre_proc_ns;
 static bool xlat_win_have;
@@ -853,15 +857,22 @@ xclipse_thread_cpu_window(void)
          const uint64_t ph_wait = __atomic_exchange_n(&xlat_phase_wait_ns, 0, __ATOMIC_RELAXED);
          const uint64_t ph_nsub = __atomic_exchange_n(&xlat_phase_submits, 0, __ATOMIC_RELAXED);
          const uint64_t ph_nwait = __atomic_exchange_n(&xlat_phase_waits, 0, __ATOMIC_RELAXED);
+         const unsigned ov_submit = __atomic_exchange_n(&xlat_overlap_submit, 0, __ATOMIC_RELAXED);
+         const unsigned ov_wait = __atomic_exchange_n(&xlat_overlap_wait, 0, __ATOMIC_RELAXED);
+         const unsigned inflight_max = __atomic_exchange_n(&xlat_inflight_max, 0, __ATOMIC_RELAXED);
          const uint64_t wall_ns = now - xlat_win_start_ns;
-         const uint64_t other_ns = wall_ns > ph_submit + ph_wait ? wall_ns - ph_submit - ph_wait : 0;
+         /* Calls on several threads can overlap in wall time and a call can straddle a window edge,
+          * so this difference is NOT a partition and the remainder is NOT "emulator-only time": it is
+          * wall time not covered by a call that this driver timed, which includes untimed Vulkan
+          * entry points, the emulator, the game, and any call spanning a boundary. */
+         const uint64_t unattr_ns = wall_ns > ph_submit + ph_wait ? wall_ns - ph_submit - ph_wait : 0;
          fprintf(stderr,
                  "radv: xclipse: phase window_ms=%llu submits=%llu in_submit_ms=%llu waits=%llu in_wait_ms=%llu "
-                 "outside_ms=%llu (%.0f%% of window outside every hooked call)\n",
+                 "unattributed_ms=%llu (%.0f%%) overlap{submit=%u wait=%u} inflight_max=%u\n",
                  (unsigned long long)(wall_ns / 1000000ull), (unsigned long long)ph_nsub,
                  (unsigned long long)(ph_submit / 1000000ull), (unsigned long long)ph_nwait,
-                 (unsigned long long)(ph_wait / 1000000ull), (unsigned long long)(other_ns / 1000000ull),
-                 wall_ns ? (double)other_ns * 100.0 / (double)wall_ns : 0.0);
+                 (unsigned long long)(ph_wait / 1000000ull), (unsigned long long)(unattr_ns / 1000000ull),
+                 wall_ns ? (double)unattr_ns * 100.0 / (double)wall_ns : 0.0, ov_submit, ov_wait, inflight_max);
          fprintf(stderr,
                  "radv: xclipse: threadcpu window_ms=%llu threads=%u%s proc_cpu_ms=%llu acct=%d%% top5=[%s]\n",
                  (unsigned long long)((now - xlat_win_start_ns) / 1000000ull), xlat_win_now.n,
@@ -893,6 +904,29 @@ radv_xclipse_phase_wait(uint64_t ns)
       return;
    __atomic_add_fetch(&xlat_phase_wait_ns, ns, __ATOMIC_RELAXED);
    __atomic_add_fetch(&xlat_phase_waits, 1, __ATOMIC_RELAXED);
+}
+
+void
+radv_xclipse_phase_enter(bool is_wait)
+{
+   if (!xclipse_latency_enabled())
+      return;
+   unsigned *inflight = is_wait ? &xlat_inflight_wait : &xlat_inflight_submit;
+   const unsigned now = __atomic_add_fetch(inflight, 1, __ATOMIC_RELAXED);
+   if (now > 1)
+      __atomic_add_fetch(is_wait ? &xlat_overlap_wait : &xlat_overlap_submit, 1, __ATOMIC_RELAXED);
+   unsigned prev = __atomic_load_n(&xlat_inflight_max, __ATOMIC_RELAXED);
+   while (now > prev && !__atomic_compare_exchange_n(&xlat_inflight_max, &prev, now, false, __ATOMIC_RELAXED,
+                                                     __ATOMIC_RELAXED)) {
+   }
+}
+
+void
+radv_xclipse_phase_exit(bool is_wait)
+{
+   if (!xclipse_latency_enabled())
+      return;
+   __atomic_sub_fetch(is_wait ? &xlat_inflight_wait : &xlat_inflight_submit, 1, __ATOMIC_RELAXED);
 }
 
 void
@@ -936,6 +970,58 @@ radv_xclipse_latency_wait(uint64_t wait_ns, uint64_t waited_submit)
    char ids[192];
    unsigned unattributed = 0;
    const unsigned retired = xlat_scan_retired(xlat_wait.slots, ids, sizeof(ids), &unattributed);
+
+   /* Spacing between successive completions measured on the GPU's own clock. Host cadence alone
+    * cannot say whether the GPU spent that time or the host did; this can, because both ends of a gap
+    * are GPU timestamps. A gap near the host cadence means the GPU advanced between them; a gap near
+    * zero with a host cadence of ~15 ms means the GPU finished them back to back and the host spaced
+    * the completions. */
+   {
+      static uint64_t ticks[XLAT_REC_MAX];
+      unsigned nt = 0;
+      for (unsigned r = 0; r < XLAT_REC_MAX; r++) {
+         const uint64_t rec = xlat_recs[r].rec;
+         if (!rec)
+            continue;
+         const uint64_t end = xlat_seen[(unsigned)(rec % XLAT_REC_MAX) * 2 + 1];
+         if (end)
+            ticks[nt++] = end;
+      }
+      for (unsigned i = 1; i < nt; i++) { /* insertion sort, nt is a few dozen in practice */
+         const uint64_t v = ticks[i];
+         unsigned j = i;
+         while (j > 0 && ticks[j - 1] > v) {
+            ticks[j] = ticks[j - 1];
+            j--;
+         }
+         ticks[j] = v;
+      }
+      if (nt > 1) {
+         static uint64_t gaps[XLAT_REC_MAX];
+         unsigned ng = 0;
+         for (unsigned i = 1; i < nt; i++) {
+            if (ticks[i] > ticks[i - 1])
+               gaps[ng++] = ticks[i] - ticks[i - 1];
+         }
+         for (unsigned i = 1; i < ng; i++) {
+            const uint64_t v = gaps[i];
+            unsigned j = i;
+            while (j > 0 && gaps[j - 1] > v) {
+               gaps[j] = gaps[j - 1];
+               j--;
+            }
+            gaps[j] = v;
+         }
+         if (ng) {
+            const double p50 = (double)gaps[ng / 2] * xlat.ns_per_tick / 1000000.0;
+            const double pmax = (double)gaps[ng - 1] * xlat.ns_per_tick / 1000000.0;
+            fprintf(stderr,
+                    "radv: xclipse: retire_gpu gaps=%u p50_ms=%.2f max_ms=%.2f span_ms=%.1f (gpu clock, same wait)\n",
+                    ng, p50, pmax,
+                    (double)(ticks[nt - 1] - ticks[0]) * xlat.ns_per_tick / 1000000.0);
+         }
+      }
+   }
 
    /* The submission this fence belongs to, resolved from the submit-side ring: its own GPU span says
     * whether the time went into this submission (start to end large) or before it started or after it

@@ -50,6 +50,8 @@ void radv_xclipse_latency_submit(const void *const *cbs, unsigned count, uint64_
 uint64_t radv_xclipse_next_submit_seq(void);
 void radv_xclipse_phase_submit(uint64_t ns);
 void radv_xclipse_phase_wait(uint64_t ns);
+void radv_xclipse_phase_enter(bool is_wait);
+void radv_xclipse_phase_exit(bool is_wait);
 void radv_xclipse_latency_wait(uint64_t wait_ns, uint64_t waited_submit);
 void radv_xclipse_native_trace_fence_wait_begin(uint32_t fence_count, uint32_t wait_all);
 
