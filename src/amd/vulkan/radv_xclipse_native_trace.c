@@ -971,6 +971,19 @@ radv_xclipse_latency_wait(uint64_t wait_ns, uint64_t waited_submit)
    unsigned unattributed = 0;
    const unsigned retired = xlat_scan_retired(xlat_wait.slots, ids, sizeof(ids), &unattributed);
 
+   /* Was the waited submission already finished before this thread blocked? Sampling at wait start
+    * answers that with no clock comparison at all: if its completion timestamp was already written,
+    * the wait is signal latency, not work; if not, the completion happened during the wait. */
+   unsigned waited_end_before_wait = 0, waited_recs = 0;
+   for (unsigned r = 0; r < XLAT_REC_MAX; r++) {
+      const struct xlat_rec *rec = &xlat_recs[r];
+      if (!rec->rec || (waited_submit && rec->submit != waited_submit))
+         continue;
+      waited_recs++;
+      if (xlat_wait.slots[(unsigned)(rec->rec % XLAT_REC_MAX) * 2 + 1])
+         waited_end_before_wait++;
+   }
+
    /* Spacing between successive completions measured on the GPU's own clock. Host cadence alone
     * cannot say whether the GPU spent that time or the host did; this can, because both ends of a gap
     * are GPU timestamps. A gap near the host cadence means the GPU advanced between them; a gap near
@@ -983,8 +996,11 @@ radv_xclipse_latency_wait(uint64_t wait_ns, uint64_t waited_submit)
          const uint64_t rec = xlat_recs[r].rec;
          if (!rec)
             continue;
-         const uint64_t end = xlat_seen[(unsigned)(rec % XLAT_REC_MAX) * 2 + 1];
-         if (end)
+         const unsigned slot = (unsigned)(rec % XLAT_REC_MAX) * 2 + 1;
+         const uint64_t end = xlat_seen[slot];
+         /* Only completions that landed during this wait: gaps across the whole run mix bursts with
+          * holes and cannot answer how the completions inside one wait were spaced. */
+         if (end && end != xlat_wait.slots[slot])
             ticks[nt++] = end;
       }
       for (unsigned i = 1; i < nt; i++) { /* insertion sort, nt is a few dozen in practice */
@@ -1016,9 +1032,10 @@ radv_xclipse_latency_wait(uint64_t wait_ns, uint64_t waited_submit)
             const double p50 = (double)gaps[ng / 2] * xlat.ns_per_tick / 1000000.0;
             const double pmax = (double)gaps[ng - 1] * xlat.ns_per_tick / 1000000.0;
             fprintf(stderr,
-                    "radv: xclipse: retire_gpu gaps=%u p50_ms=%.2f max_ms=%.2f span_ms=%.1f (gpu clock, same wait)\n",
-                    ng, p50, pmax,
-                    (double)(ticks[nt - 1] - ticks[0]) * xlat.ns_per_tick / 1000000.0);
+                    "radv: xclipse: retire_gpu during_wait gaps=%u p50_ms=%.2f max_ms=%.2f span_ms=%.1f "
+                    "waited_end_at_wait_start=%u of %u (gpu clock)\n",
+                    ng, p50, pmax, (double)(ticks[nt - 1] - ticks[0]) * xlat.ns_per_tick / 1000000.0,
+                    waited_end_before_wait, waited_recs);
          }
       }
    }
