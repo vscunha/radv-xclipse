@@ -42,7 +42,7 @@
 #if defined(__GNUC__)
 void radv_xclipse_native_trace_fence_wait(const void *active_sync, uint32_t fence_count, uint32_t wait_all, int result,
                                           uint64_t wait_ns) __attribute__((weak));
-void radv_xclipse_native_trace_fence_wait_begin(uint32_t fence_count, uint32_t wait_all) __attribute__((weak));
+void radv_xclipse_native_trace_fence_wait_begin(const void *active_sync, uint32_t fence_count, uint32_t wait_all) __attribute__((weak));
 void radv_xclipse_phase_enter(bool is_wait) __attribute__((weak));
 void radv_xclipse_phase_exit(bool is_wait) __attribute__((weak));
 #endif
@@ -299,7 +299,8 @@ vk_common_WaitForFences(VkDevice _device,
    /* Sampled before the wait, so the hooks together can say whether any command buffer retired
     * during it (the GPU was executing) or none did (it was not). */
    if (radv_xclipse_native_trace_fence_wait_begin)
-      radv_xclipse_native_trace_fence_wait_begin(fenceCount, waitAll);
+      radv_xclipse_native_trace_fence_wait_begin(
+         fenceCount ? vk_fence_get_active_sync((struct vk_fence *)pFences[0]) : NULL, fenceCount, waitAll);
    if (radv_xclipse_phase_enter)
       radv_xclipse_phase_enter(true);
 #endif

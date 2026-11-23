@@ -403,6 +403,8 @@ typedef struct {
    uint64_t n;                     /* entries snapshot, 0 = nothing in flight */
    uint64_t host_ns;
    uint64_t proc_ns;
+   uint64_t newest_seq;   /* newest signaller of the waited sync, resolved when the app blocked */
+   uint64_t sync;         /* the sync object as an identity, for the line */
 } xlat_wait_window;
 
 static struct {
@@ -993,7 +995,7 @@ radv_xclipse_phase_exit(bool is_wait)
 }
 
 void
-radv_xclipse_native_trace_fence_wait_begin(uint32_t fence_count, uint32_t wait_all)
+radv_xclipse_native_trace_fence_wait_begin(const void *active_sync, uint32_t fence_count, uint32_t wait_all)
 {
    (void)fence_count;
    (void)wait_all;
@@ -1016,6 +1018,22 @@ radv_xclipse_native_trace_fence_wait_begin(uint32_t fence_count, uint32_t wait_a
       w->slots[w->n] = xlat.map[rec * XLAT_SLOT_DW + XLAT_COMPLETION];
       w->arrivals[w->n] = xlat.map[rec * XLAT_SLOT_DW + XLAT_ARRIVAL];
       w->n++;
+   }
+   /* Which submission must retire for this wait to return, resolved now rather than after the wait: a
+    * binary fence is re-signalled by every submission, so the newest signaller *at block time* is the
+    * fence the application holds. Resolving it afterwards picks up signals submitted during the wait,
+    * which is what made the previous build's candidate set unreadable. */
+   w->sync = (uint64_t)(uintptr_t)active_sync;
+   w->newest_seq = 0;
+   if (active_sync && radv_xclipse_submit_diag()) {
+      const uint64_t newest = xd_seq;
+      for (unsigned n = 0; n < XD_SYNC_RING && n < newest; n++) {
+         const struct xd_sync *e = &xd_ring[(newest - 1 - n) % XD_SYNC_RING];
+         if (e->sync == active_sync) {
+            w->newest_seq = e->seq;
+            break;
+         }
+      }
    }
    w->host_ns = os_time_get_nano();
    w->proc_ns = xclipse_proc_cpu_ns();
@@ -1073,6 +1091,25 @@ radv_xclipse_latency_wait(uint64_t wait_ns, uint64_t waited_submit, const void *
          if (!dup)
             cand_seq[ncand++] = e->seq;
       }
+   }
+
+   /* The exact subject: the newest signaller of this sync when the thread blocked. */
+   uint64_t newest_rec[XLAT_IDS_MAX];
+   const unsigned newest_n = xlat_recall_submit(w->newest_seq, newest_rec, XLAT_IDS_MAX);
+   unsigned newest_at_start = 0, newest_during = 0, newest_missing = 0, newest_recs = 0;
+   for (unsigned i = 0; i < newest_n; i++) {
+      const uint64_t at_start = xlat_wait_snapshot(w, newest_rec[i], XLAT_COMPLETION);
+      if (at_start == XLAT_SNAPSHOT_MISSING) {
+         newest_missing++;
+         continue;
+      }
+      newest_recs++;
+      if (xlat_slot_written(at_start))
+         newest_at_start++;
+      else if (xlat_slot_written(xlat.map[newest_rec[i] * XLAT_SLOT_DW + XLAT_COMPLETION]))
+         newest_during++;
+      else
+         newest_missing++;
    }
 
    uint64_t waited_rec[XLAT_IDS_MAX];
@@ -1227,12 +1264,14 @@ radv_xclipse_latency_wait(uint64_t wait_ns, uint64_t waited_submit, const void *
 
    fprintf(stderr,
            "radv: xclipse: latency wait_ms=%llu waited_submit=%llu waited_span_ms=%lld waited_end_missing=%u of %u "
-           "waited_unresolved=%u waited_cands=%u cand_recs=%u cand_retired_at_start=%u cand_retired_during=%u "
+           "waited_unresolved=%u newest_seq=%llu newest_recs=%u newest_retired_at_start=%u newest_retired_during=%u "
+           "newest_unresolved=%u waited_cands=%u cand_recs=%u cand_retired_at_start=%u cand_retired_during=%u "
            "cand_unresolved=%u cbs_retired=%u[%s] window=%llu coverage{instr=%llu uninstr=%llu unrecorded=%llu "
-           "reused=%llu slotless=%llu cap=%u} overlaps=%u host_advanced_ms=%lld proc_cpu_ms=%lld acct=%d%% "
+           "reused=%llu slotless=%llu cap=%u} overlaps_total=%u host_advanced_ms=%lld proc_cpu_ms=%lld acct=%d%% "
            "threads=%u%s ioctl_ticks=%llu window_left=%d top5=[%s]\n",
            (unsigned long long)(wait_ns / 1000000ull), (unsigned long long)waited_submit, (long long)span_ms,
-           span_missing_end, span_recs, waited_unresolved, ncand, cand_recs, cand_retired_at_start,
+           span_missing_end, span_recs, waited_unresolved, (unsigned long long)w->newest_seq, newest_recs,
+           newest_at_start, newest_during, newest_missing, ncand, cand_recs, cand_retired_at_start,
            cand_retired_during, cand_unresolved, retired, ids, (unsigned long long)w->n,
            (unsigned long long)xlat_rec_next, (unsigned long long)xlat_uninstrumented,
            (unsigned long long)xlat_unrecorded, (unsigned long long)xlat_reused, (unsigned long long)xlat_slotless,

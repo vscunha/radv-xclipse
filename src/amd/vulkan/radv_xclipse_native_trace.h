@@ -53,7 +53,7 @@ void radv_xclipse_phase_wait(uint64_t ns);
 void radv_xclipse_phase_enter(bool is_wait);
 void radv_xclipse_phase_exit(bool is_wait);
 void radv_xclipse_latency_wait(uint64_t wait_ns, uint64_t waited_submit, const void *active_sync);
-void radv_xclipse_native_trace_fence_wait_begin(uint32_t fence_count, uint32_t wait_all);
+void radv_xclipse_native_trace_fence_wait_begin(const void *active_sync, uint32_t fence_count, uint32_t wait_all);
 
 /* Weak hook used by the shared Vulkan fence code. `active_sync` is the vk_sync the wait blocks on
  * (vk_fence_get_active_sync), which is the key radv_xclipse_diag_note_signal() recorded. */
