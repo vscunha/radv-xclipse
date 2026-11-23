@@ -8,6 +8,7 @@
  * never changes the command stream and never dumps a full BO.
  */
 #include "radv_xclipse_native_trace.h"
+#include "radv_xclipse_latency_slots.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -390,17 +391,18 @@ radv_xclipse_diag_submit(uint64_t submit_seq, uint32_t ip_type, uint32_t cmd_buf
  * written, so identity comes from the recording instance and the submission attached to it rather
  * than from the slot number. A recording that is executed twice is reported as reused, not counted
  * as two completions. */
-#define XLAT_REC_MAX 1024
-#define XLAT_SLOTS (XLAT_REC_MAX * 2)
-#define XLAT_IDS_MAX 8
-
-struct xlat_rec {
-   const void *cb;
-   uint64_t rec; /* recording instance, 0 = unused */
-   uint64_t submit;
-   uint64_t end_host_ns;
-   bool ended;
-};
+/* Recordings older than this window are not scanned at a wait: the value of the scan is knowing which
+ * of the recordings that could still be in flight retired while the thread was blocked. */
+#define XLAT_WINDOW 4096u
+#define XLAT_SUB_RING 64u
+typedef struct {
+   uint64_t slots[XLAT_WINDOW];    /* completion value at wait start, rec = base + i */
+   uint64_t arrivals[XLAT_WINDOW]; /* arrival value at wait start, level 2 only */
+   uint64_t base;                  /* recording instance of slots[0] */
+   uint64_t n;                     /* entries snapshot, 0 = nothing in flight */
+   uint64_t host_ns;
+   uint64_t proc_ns;
+} xlat_wait_window;
 
 static struct {
    struct radeon_winsys *ws;
@@ -411,14 +413,69 @@ static struct {
    bool failed;
 } xlat;
 
-static struct xlat_rec xlat_recs[XLAT_REC_MAX];
-static uint64_t xlat_seen[XLAT_SLOTS]; /* last sampled value of every slot, host side */
 static uint64_t xlat_rec_next;
 static uint64_t xlat_uninstrumented; /* command buffers whose queue family cannot carry the packet */
-static uint64_t xlat_wraps;          /* ring entries reused before their submission was seen */
 static uint64_t xlat_unrecorded;     /* submitted command buffers with no recording record */
 static uint64_t xlat_reused;         /* command buffers submitted again after a first submit */
-static uint64_t xlat_slotless;       /* retirements seen in slots whose record was overwritten */
+static uint64_t xlat_slotless;       /* recordings refused because the buffer is full */
+
+/* One submission's recording instances, recalled by submit sequence at a wait. Seqlock: the tag is odd
+ * while the entry is being written and holds submit * 2 + 2 once it is stable, so a torn read is
+ * detected and reported as unresolved instead of being attributed to the wrong recordings. */
+static xlat_sub_entry xlat_subs[XLAT_SUB_RING];
+
+/* Bounded capture window: dense per-submission lines are only affordable where the transition is, so
+ * they are armed by the first long wait and limited to a fixed number of waits afterwards. */
+static int xlat_window_left; /* > 0: armed, waits left; 0: closed, __atomic_* on a plain int */
+static unsigned xlat_window_frames = 240;
+static uint64_t xlat_window_ms = 150;
+static bool xlat_window_on;
+static unsigned xlat_window_opened;
+
+static uint64_t
+xlat_env_u64(const char *name, uint64_t def)
+{
+   const char *v = getenv(name);
+   return v && *v ? (uint64_t)strtoull(v, NULL, 0) : def;
+}
+
+static void
+xlat_window_config(void)
+{
+   static int done;
+   if (done)
+      return;
+   done = 1;
+   xlat_window_on = xlat_env_u64("RADV_XCLIPSE_WINDOW", 0) != 0;
+   xlat_window_frames = (unsigned)xlat_env_u64("RADV_XCLIPSE_WINDOW_FRAMES", 240);
+   xlat_window_ms = xlat_env_u64("RADV_XCLIPSE_WINDOW_MS", 150);
+   if (!xlat_window_on)
+      xlat_window_frames = 0;
+}
+
+/* The value the slot held when the wait began, or XLAT_SNAPSHOT_MISSING when the recording was not in
+ * the snapshot. Both cases are reported, neither is silently treated as "not retired". */
+static uint64_t
+xlat_wait_snapshot(const xlat_wait_window *w, uint64_t rec, unsigned slot)
+{
+   const uint64_t i = xlat_snapshot_index(w->base, w->n, rec);
+   if (i == XLAT_SNAPSHOT_MISSING)
+      return XLAT_SNAPSHOT_MISSING;
+   return slot == XLAT_COMPLETION ? w->slots[i] : w->arrivals[i];
+}
+
+static void
+xlat_remember_submit(uint64_t submit, const uint64_t *recs, unsigned n)
+{
+   xlat_store_entry(&xlat_subs[submit % XLAT_SUB_RING], submit, recs, n);
+}
+
+/* Returns the number of recording instances recalled; 0 means unresolved, never a guess. */
+static unsigned
+xlat_recall_submit(uint64_t submit, uint64_t *recs, unsigned cap)
+{
+   return xlat_recall_from_entry(&xlat_subs[submit % XLAT_SUB_RING], submit, recs, cap);
+}
 
 /* Nothing in this instrument may block a recording thread. An earlier version held a mutex across a
  * fence wait, which is held for seconds here, and took the same mutex while recording: that stalls
@@ -457,7 +514,8 @@ xclipse_latency_enabled(void)
 static void xclipse_thread_cpu_window(void);
 
 /* Every slot is cleared before the GPU sees the buffer: a stale non-zero value would read as a
- * retirement that never happened. */
+ * retirement that never happened. This is the only clear the buffer ever gets, and it happens before
+ * any recording can be submitted, so no GPU write can race it. */
 static bool
 xlat_ensure_bo(struct radv_device *device)
 {
@@ -469,7 +527,7 @@ xlat_ensure_bo(struct radv_device *device)
       return true;
    }
    struct radeon_winsys *ws = device->ws;
-   if (ws->buffer_create(ws, XLAT_SLOTS * 8, 4096, RADEON_DOMAIN_GTT,
+   if (ws->buffer_create(ws, (uint64_t)XLAT_REC_CAP * XLAT_STRIDE_B, 4096, RADEON_DOMAIN_GTT,
                          RADEON_FLAG_CPU_ACCESS | RADEON_FLAG_GTT_WC | RADEON_FLAG_NO_INTERPROCESS_SHARING, 0, 0,
                          &xlat.bo) != VK_SUCCESS ||
        !xlat.bo) {
@@ -488,43 +546,39 @@ xlat_ensure_bo(struct radv_device *device)
       fprintf(stderr, "radv: xclipse: latency: timestamp buffer not mapped, instrument off\n");
       return false;
    }
-   for (unsigned i = 0; i < XLAT_SLOTS; i++)
+   for (uint64_t i = 0; i < (uint64_t)XLAT_REC_CAP * XLAT_SLOT_DW; i++)
       xlat.map[i] = 0;
-   for (unsigned i = 0; i < XLAT_SLOTS; i++)
-      xlat_seen[i] = 0;
    __atomic_store_n(&xlat.bo, xlat.bo, __ATOMIC_RELEASE);
    pthread_mutex_unlock(&xlat_bo_mu);
    return true;
 }
 
-/* Retirement sampler. Compares every slot against `pre` (a snapshot) or against the last sample, and
- * returns how many changed, naming the recording instances involved. Slots whose record has been
- * overwritten are counted separately rather than attributed to the wrong recording. */
+/* Retirement sampler for the in-flight window only. A slot counts as retired when it holds a
+ * timestamp that was not there when the window was snapshotted, and the recording instance of that
+ * slot is its index: the count and the names can therefore only refer to the recordings that own the
+ * slots, which a modulo-indexed ring could not promise. */
 static unsigned
-xlat_scan_retired(const uint64_t *pre, char *ids, size_t ids_size, unsigned *unattributed)
+xlat_scan_window(const xlat_wait_window *w, uint64_t *ticks, unsigned ticks_cap, char *ids, size_t ids_size,
+                 unsigned *nticks)
 {
    size_t off = 0;
-   unsigned n = 0;
+   unsigned n = 0, nt = 0;
    ids[0] = 0;
-   *unattributed = 0;
-   for (unsigned i = 0; i < XLAT_SLOTS; i++) {
-      const uint64_t value = xlat.map[i];
-      if (!value || value == (pre ? pre[i] : xlat_seen[i]))
+   for (uint64_t i = 0; i < w->n; i++) {
+      const uint64_t rec = w->base + i;
+      const uint64_t value = xlat.map[rec * XLAT_SLOT_DW + XLAT_COMPLETION];
+      if (!xlat_slot_written(value) || value == w->slots[i])
          continue;
-      xlat_seen[i] = value;
-      const struct xlat_rec *r = &xlat_recs[i / 2];
-      if (!r->rec) {
-         (*unattributed)++;
-         continue;
-      }
       n++;
+      if (ticks && nt < ticks_cap)
+         ticks[nt++] = value;
       if (off + 1 < ids_size && n <= XLAT_IDS_MAX) {
-         const int w = snprintf(ids + off, ids_size - off, "%s%llu%c", n > 1 ? "," : "", (unsigned long long)r->rec,
-                                (i & 1) ? 'e' : 's');
-         if (w > 0)
-            off += (size_t)w;
+         const int written = snprintf(ids + off, ids_size - off, "%s%llu", n > 1 ? "," : "", (unsigned long long)rec);
+         if (written > 0)
+            off += (size_t)written;
       }
    }
+   *nticks = nt;
    return n;
 }
 
@@ -543,17 +597,23 @@ radv_xclipse_latency_cb_begin(struct radv_cmd_buffer *cmd_buffer)
    if (!xlat_ensure_bo(device))
       return;
    const uint64_t rec = __atomic_add_fetch(&xlat_rec_next, 1, __ATOMIC_RELAXED);
-   const unsigned ring = (unsigned)(rec % XLAT_REC_MAX);
-   struct xlat_rec *r = &xlat_recs[ring];
-   /* Overwriting an entry whose submission was never seen means a gap in the chain, not a
-    * retirement; count it so the coverage figures stay honest. */
-   if (__atomic_load_n(&r->rec, __ATOMIC_RELAXED) && !__atomic_load_n(&r->submit, __ATOMIC_RELAXED))
-      __atomic_add_fetch(&xlat_wraps, 1, __ATOMIC_RELAXED);
-   r->cb = cmd_buffer;
-   r->submit = 0;
-   r->ended = false;
-   __atomic_store_n(&r->rec, rec, __ATOMIC_RELAXED);
+   /* The slot index is the recording instance itself, never a modulus: a slot cannot then be reused
+    * by a later recording while the GPU may still write it, and any value found there belongs to the
+    * recording named by the index. Recordings past the capacity are refused and counted. */
+   if (!xlat_rec_in_range(rec)) {
+      __atomic_add_fetch(&xlat_slotless, 1, __ATOMIC_RELAXED);
+      cmd_buffer->xc_lat_rec = 0;
+      return;
+   }
+   /* The recording instance lives in the command buffer, so the submission that carries it needs no
+    * table scan to know which recording it hands over. */
    cmd_buffer->xc_lat_rec = rec;
+   cmd_buffer->xc_lat_submit = 0;
+   /* Pending markers before the GPU can touch the pair, written by the host: the GPU overwrites them
+    * with timestamps, so "written" is decidable without a clock and a marker's top bit can never be
+    * mistaken for a timestamp. */
+   xlat.map[rec * XLAT_SLOT_DW + XLAT_ARRIVAL] = xlat_pending_value(rec);
+   xlat.map[rec * XLAT_SLOT_DW + XLAT_COMPLETION] = xlat_pending_value(rec);
 
    if (xclipse_latency_level() < 2)
       return;
@@ -561,7 +621,8 @@ radv_xclipse_latency_cb_begin(struct radv_cmd_buffer *cmd_buffer)
     * level 2, and never the first packet of the stream. */
    radeon_check_space(device->ws, cmd_buffer->cs->b, 32);
    radv_cs_add_buffer(device->ws, cmd_buffer->cs->b, xlat.bo);
-   radv_write_timestamp(cmd_buffer, xlat.va + (uint64_t)ring * 16, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT);
+   radv_write_timestamp(cmd_buffer, xlat.va + xlat_rec_offset(rec) + XLAT_ARRIVAL * 8,
+                        VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT);
 }
 
 void
@@ -572,59 +633,59 @@ radv_xclipse_latency_cb_end(struct radv_cmd_buffer *cmd_buffer)
       return;
 
    const uint64_t rec = cmd_buffer->xc_lat_rec;
-   if (!rec)
+   if (!xlat_rec_in_range(rec))
       return;
-   cmd_buffer->xc_lat_rec = 0;
+   /* The recording instance is kept, not cleared: the submit path reads it to say which recording a
+    * submission carries. A re-recording overwrites it at its own begin. */
 
    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
-   const unsigned ring = (unsigned)(rec % XLAT_REC_MAX);
    radeon_check_space(device->ws, cmd_buffer->cs->b, 32);
    radv_cs_add_buffer(device->ws, cmd_buffer->cs->b, xlat.bo);
-   radv_write_timestamp(cmd_buffer, xlat.va + (uint64_t)ring * 16 + 8, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT);
-
-   struct xlat_rec *r = &xlat_recs[ring];
-   if (__atomic_load_n(&r->rec, __ATOMIC_RELAXED) == rec) {
-      r->ended = true;
-      r->end_host_ns = os_time_get_nano();
-   }
+   radv_write_timestamp(cmd_buffer, xlat.va + xlat_rec_offset(rec) + XLAT_COMPLETION * 8,
+                        VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT);
 }
 
-/* Called once per vkQueueSubmit, after the submission was handed to the kernel. Attaches the submit
- * sequence to every recording instance in it, so a later retirement in a slot can be placed in the
- * submit order, and reports what has been observed to retire since the previous sample. */
+/* Called once per vkQueueSubmit, after the submission was handed to the kernel. The recording
+ * instances a submission carries come from the command buffers themselves, not from a search of the
+ * table: a pointer search cannot tell two recordings of one command buffer apart, and its cost grows
+ * with the capacity, which is why the capacity could not be raised while it existed.
+ *
+ * Per-submission lines are the bulk of this instrument's output, so they are emitted only inside the
+ * bounded capture window (RADV_XCLIPSE_WINDOW); outside it the two-second line still reports the
+ * submission rate, which is what a run without a window needs. */
 void
 radv_xclipse_latency_submit(const void *const *cbs, unsigned count, uint64_t submit)
 {
    if (!xclipse_latency_enabled() || xlat.failed || !xlat.map)
       return;
 
+   uint64_t recs[XLAT_IDS_MAX];
+   unsigned nrec = 0;
    for (unsigned i = 0; i < count; i++) {
-      struct xlat_rec *best = NULL;
-      for (unsigned r = 0; r < XLAT_REC_MAX; r++) {
-         if (xlat_recs[r].rec && xlat_recs[r].cb == cbs[i] && (!best || xlat_recs[r].rec > best->rec))
-            best = &xlat_recs[r];
-      }
-      if (!best)
+      struct radv_cmd_buffer *cb = (struct radv_cmd_buffer *)(uintptr_t)cbs[i];
+      const uint64_t rec = cb->xc_lat_rec;
+      if (!xlat_rec_in_range(rec)) {
          xlat_unrecorded++;
-      else if (best->submit)
+         continue;
+      }
+      if (cb->xc_lat_submit)
          xlat_reused++;
-      else
-         best->submit = submit;
+      cb->xc_lat_submit = submit;
+      if (nrec < XLAT_IDS_MAX)
+         recs[nrec++] = rec;
    }
+   xlat_remember_submit(submit, recs, nrec);
 
-   char ids[192];
-   unsigned unattributed = 0;
-   const unsigned retired = xlat_scan_retired(NULL, ids, sizeof(ids), &unattributed);
-   if (retired)
-      fprintf(stderr, "radv: xclipse: lat retired_observed submit=%llu count=%u recs=[%s] unattributed=%u\n",
-              (unsigned long long)submit, retired, ids, unattributed);
+   if (__atomic_load_n(&xlat_window_left, __ATOMIC_RELAXED) <= 0)
+      return;
+
    fprintf(stderr,
-           "radv: xclipse: lat submit=%llu cbs=%u host_ns=%llu coverage{instr=%llu uninstr=%llu unrecorded=%llu "
-           "reused=%llu wraps=%llu slotless=%llu}\n",
-           (unsigned long long)submit, count, (unsigned long long)os_time_get_nano(),
+           "radv: xclipse: lat submit=%llu cbs=%u recs=%u host_ns=%llu coverage{instr=%llu uninstr=%llu "
+           "unrecorded=%llu reused=%llu slotless=%llu cap=%u window=%d}\n",
+           (unsigned long long)submit, count, nrec, (unsigned long long)os_time_get_nano(),
            (unsigned long long)xlat_rec_next, (unsigned long long)xlat_uninstrumented,
-           (unsigned long long)xlat_unrecorded, (unsigned long long)xlat_reused, (unsigned long long)xlat_wraps,
-           (unsigned long long)xlat_slotless);
+           (unsigned long long)xlat_unrecorded, (unsigned long long)xlat_reused, (unsigned long long)xlat_slotless,
+           XLAT_REC_CAP, __atomic_load_n(&xlat_window_left, __ATOMIC_RELAXED));
 }
 
 /* ---- per-thread CPU accounting (RADV_XCLIPSE_LATENCY) --------------------------------------- */
@@ -676,9 +737,7 @@ static bool xlat_win_have;
 
 static struct {
    bool armed;
-   uint64_t slots[XLAT_SLOTS];
-   uint64_t host_ns;
-   uint64_t proc_ns;
+   xlat_wait_window w;
 } xlat_wait = {0};
 
 static uint64_t
@@ -942,10 +1001,20 @@ radv_xclipse_native_trace_fence_wait_begin(uint32_t fence_count, uint32_t wait_a
       xlat_overlaps++;
       return;
    }
-   for (unsigned i = 0; i < XLAT_SLOTS; i++)
-      xlat_wait.slots[i] = xlat.map[i];
-   xlat_wait.host_ns = os_time_get_nano();
-   xlat_wait.proc_ns = xclipse_proc_cpu_ns();
+   /* Snapshot the in-flight window, not the whole buffer: which recordings could still be running is
+    * what the wait has to attribute, and the snapshot is the only thing that can say what a slot held
+    * before the thread blocked. */
+   const uint64_t next = __atomic_load_n(&xlat_rec_next, __ATOMIC_RELAXED);
+   xlat_wait_window *w = &xlat_wait.w;
+   w->base = next > XLAT_WINDOW ? next - XLAT_WINDOW : 1;
+   w->n = 0;
+   for (uint64_t rec = w->base; rec < next && w->n < XLAT_WINDOW; rec++) {
+      w->slots[w->n] = xlat.map[rec * XLAT_SLOT_DW + XLAT_COMPLETION];
+      w->arrivals[w->n] = xlat.map[rec * XLAT_SLOT_DW + XLAT_ARRIVAL];
+      w->n++;
+   }
+   w->host_ns = os_time_get_nano();
+   w->proc_ns = xclipse_proc_cpu_ns();
    xclipse_snapshot_threads(&xlat_wait_pre);
    xlat_wait.armed = true;
 }
@@ -962,48 +1031,45 @@ radv_xclipse_latency_wait(uint64_t wait_ns, uint64_t waited_submit)
       return;
    }
 
+   const xlat_wait_window *w = &xlat_wait.w;
+
    /* Not a wall clock on this platform: this shim returns the raw CP tick count although the UAPI
     * says nanoseconds (measured over one wait: 14.28M ticks against 13M "ns", ratio 1.06; the CP
     * clock works out at 26.18 MHz against a declared 25.6). Printed as ticks so nobody scales it. */
    const uint64_t ioctl_ticks = xlat.ws->query_value(xlat.ws, RADEON_TIMESTAMP);
 
+   /* Recordings that retired while this thread was blocked, named by recording instance. Identity is
+    * the slot index, so a name can only belong to the recording that owns it. */
+   static uint64_t ticks[XLAT_WINDOW];
    char ids[192];
-   unsigned unattributed = 0;
-   const unsigned retired = xlat_scan_retired(xlat_wait.slots, ids, sizeof(ids), &unattributed);
+   unsigned nticks = 0;
+   const unsigned retired = xlat_scan_window(w, ticks, XLAT_WINDOW, ids, sizeof(ids), &nticks);
 
-   /* Was the waited submission already finished before this thread blocked? Sampling at wait start
-    * answers that with no clock comparison at all: if its completion timestamp was already written,
-    * the wait is signal latency, not work; if not, the completion happened during the wait. */
-   unsigned waited_end_before_wait = 0, waited_recs = 0;
-   for (unsigned r = 0; r < XLAT_REC_MAX; r++) {
-      const struct xlat_rec *rec = &xlat_recs[r];
-      if (!rec->rec || (waited_submit && rec->submit != waited_submit))
+   /* Was the waited submission already finished before this thread blocked? Answered with the
+    * wait-start snapshot of the recordings that exact submission carried, recalled by submit sequence
+    * -- not by "the newest submission that touched this sync object". When the recall fails the
+    * answer is reported as unresolved, never guessed. */
+   uint64_t waited_rec[XLAT_IDS_MAX];
+   const unsigned waited_n = xlat_recall_submit(waited_submit, waited_rec, XLAT_IDS_MAX);
+   const unsigned waited_unresolved = waited_submit && !waited_n ? 1 : 0;
+   unsigned waited_end_before_wait = 0, waited_outside_window = 0;
+   for (unsigned i = 0; i < waited_n; i++) {
+      const uint64_t at_start = xlat_wait_snapshot(w, waited_rec[i], XLAT_COMPLETION);
+      if (at_start == XLAT_SNAPSHOT_MISSING) {
+         waited_outside_window++;
          continue;
-      waited_recs++;
-      if (xlat_wait.slots[(unsigned)(rec->rec % XLAT_REC_MAX) * 2 + 1])
+      }
+      if (xlat_slot_written(at_start))
          waited_end_before_wait++;
    }
 
    /* Spacing between successive completions measured on the GPU's own clock. Host cadence alone
     * cannot say whether the GPU spent that time or the host did; this can, because both ends of a gap
-    * are GPU timestamps. A gap near the host cadence means the GPU advanced between them; a gap near
-    * zero with a host cadence of ~15 ms means the GPU finished them back to back and the host spaced
-    * the completions. */
+    * are GPU timestamps. Only completions that landed during this wait are counted: gaps across the
+    * whole run mix bursts with holes and cannot answer how the completions inside one wait were
+    * spaced. */
    {
-      static uint64_t ticks[XLAT_REC_MAX];
-      unsigned nt = 0;
-      for (unsigned r = 0; r < XLAT_REC_MAX; r++) {
-         const uint64_t rec = xlat_recs[r].rec;
-         if (!rec)
-            continue;
-         const unsigned slot = (unsigned)(rec % XLAT_REC_MAX) * 2 + 1;
-         const uint64_t end = xlat_seen[slot];
-         /* Only completions that landed during this wait: gaps across the whole run mix bursts with
-          * holes and cannot answer how the completions inside one wait were spaced. */
-         if (end && end != xlat_wait.slots[slot])
-            ticks[nt++] = end;
-      }
-      for (unsigned i = 1; i < nt; i++) { /* insertion sort, nt is a few dozen in practice */
+      for (unsigned i = 1; i < nticks; i++) { /* insertion sort, nticks is a few dozen in practice */
          const uint64_t v = ticks[i];
          unsigned j = i;
          while (j > 0 && ticks[j - 1] > v) {
@@ -1012,10 +1078,10 @@ radv_xclipse_latency_wait(uint64_t wait_ns, uint64_t waited_submit)
          }
          ticks[j] = v;
       }
-      if (nt > 1) {
-         static uint64_t gaps[XLAT_REC_MAX];
+      if (nticks > 1) {
+         static uint64_t gaps[XLAT_WINDOW];
          unsigned ng = 0;
-         for (unsigned i = 1; i < nt; i++) {
+         for (unsigned i = 1; i < nticks; i++) {
             if (ticks[i] > ticks[i - 1])
                gaps[ng++] = ticks[i] - ticks[i - 1];
          }
@@ -1033,49 +1099,47 @@ radv_xclipse_latency_wait(uint64_t wait_ns, uint64_t waited_submit)
             const double pmax = (double)gaps[ng - 1] * xlat.ns_per_tick / 1000000.0;
             fprintf(stderr,
                     "radv: xclipse: retire_gpu during_wait gaps=%u p50_ms=%.2f max_ms=%.2f span_ms=%.1f "
-                    "waited_end_at_wait_start=%u of %u (gpu clock)\n",
-                    ng, p50, pmax, (double)(ticks[nt - 1] - ticks[0]) * xlat.ns_per_tick / 1000000.0,
-                    waited_end_before_wait, waited_recs);
+                    "waited_end_at_wait_start=%u of %u (gpu clock; unresolved=%u outside_window=%u)\n",
+                    ng, p50, pmax, (double)(ticks[nticks - 1] - ticks[0]) * xlat.ns_per_tick / 1000000.0,
+                    waited_end_before_wait, waited_n - waited_outside_window, waited_unresolved,
+                    waited_outside_window);
          }
       }
    }
 
-   /* The submission this fence belongs to, resolved from the submit-side ring: its own GPU span says
-    * whether the time went into this submission (start to end large) or before it started or after it
-    * finished. A span is a difference of two GPU timestamps, never of a GPU and a host one. */
+   /* The submission's own GPU span: a difference of two GPU timestamps, never of a GPU and a host
+    * one. At level 1 the arrival slot stays pending, so the span is reported missing rather than
+    * computed from one end. */
    int64_t span_ms = -1;
    unsigned span_recs = 0, span_missing_end = 0;
-   if (waited_submit) {
-      int64_t lo = 0, hi = 0;
+   if (waited_n) {
+      uint64_t lo = 0, hi = 0;
       bool have = false;
-      for (unsigned r = 0; r < XLAT_REC_MAX; r++) {
-         const struct xlat_rec *rec = &xlat_recs[r];
-         if (!rec->rec || rec->submit != waited_submit)
-            continue;
+      for (unsigned i = 0; i < waited_n; i++) {
+         const uint64_t rec = waited_rec[i];
+         const uint64_t arrival = xlat.map[rec * XLAT_SLOT_DW + XLAT_ARRIVAL];
+         const uint64_t end = xlat.map[rec * XLAT_SLOT_DW + XLAT_COMPLETION];
          span_recs++;
-         const uint64_t start_ticks = xlat_seen[(unsigned)(rec->rec % XLAT_REC_MAX) * 2];
-         const uint64_t end_ticks = xlat_seen[(unsigned)(rec->rec % XLAT_REC_MAX) * 2 + 1];
-         if (!end_ticks) {
+         if (!xlat_slot_written(end)) {
             span_missing_end++;
             continue;
          }
-         if (!start_ticks || end_ticks < start_ticks)
+         if (!xlat_slot_written(arrival))
             continue;
-         if (!have || (int64_t)start_ticks < lo)
-            lo = (int64_t)start_ticks;
-         if (!have || (int64_t)end_ticks > hi)
-            hi = (int64_t)end_ticks;
+         if (!have || arrival < lo)
+            lo = arrival;
+         if (!have || end > hi)
+            hi = end;
          have = true;
       }
-      if (have)
+      if (have && hi >= lo)
          span_ms = (int64_t)((double)(hi - lo) * xlat.ns_per_tick / 1000000.0);
    }
 
    const uint64_t now = os_time_get_nano();
-   const int64_t host_adv_ms = (int64_t)((now - xlat_wait.host_ns) / 1000000ull);
+   const int64_t host_adv_ms = (int64_t)((now - w->host_ns) / 1000000ull);
    const uint64_t now_cpu = xclipse_proc_cpu_ns();
-   const uint64_t proc_delta =
-      (now_cpu && xlat_wait.proc_ns && now_cpu > xlat_wait.proc_ns) ? now_cpu - xlat_wait.proc_ns : 0;
+   const uint64_t proc_delta = (now_cpu && w->proc_ns && now_cpu > w->proc_ns) ? now_cpu - w->proc_ns : 0;
    const int64_t proc_cpu_ms = proc_delta ? (int64_t)(proc_delta / 1000000ull) : -1;
 
    struct xlat_top top[5];
@@ -1090,19 +1154,41 @@ radv_xclipse_latency_wait(uint64_t wait_ns, uint64_t waited_submit)
    char list[320];
    xclipse_format_top(list, sizeof(list), top, n);
 
-   /* One line, one wait. cbs_retired counts slots that changed while this thread was blocked, which
-    * is evidence of GPU progress, not proof of idleness when it is zero: uninstrumented command
-    * buffers and overwritten records are reported alongside so a zero can be classified. */
+   /* Bounded capture: the transition is where the per-submission lines are worth their volume, so the
+    * first long wait opens a window and the budget closes it. Outside the window only this line is
+    * printed, which keeps a whole run affordable. */
+   xlat_window_config();
+   int window_left = __atomic_load_n(&xlat_window_left, __ATOMIC_RELAXED);
+   if (window_left == 0 && xlat_window_frames && wait_ns >= xlat_window_ms * 1000000ull) {
+      window_left = (int)xlat_window_frames;
+      __atomic_store_n(&xlat_window_left, window_left, __ATOMIC_RELAXED);
+      xlat_window_opened++;
+      fprintf(stderr, "radv: xclipse: lat window open #%u at wait_ms=%llu threshold_ms=%llu frames=%u\n",
+              xlat_window_opened, (unsigned long long)(wait_ns / 1000000ull),
+              (unsigned long long)xlat_window_ms, xlat_window_frames);
+   }
+
+   /* One line, one wait. cbs_retired counts recordings that completed while this thread was blocked,
+    * which is evidence of GPU progress, not proof of idleness when it is zero: the window size and the
+    * uninstrumented count are reported beside it so a zero can be classified. */
    fprintf(stderr,
            "radv: xclipse: latency wait_ms=%llu waited_submit=%llu waited_span_ms=%lld waited_end_missing=%u of %u "
-           "cbs_retired=%u[%s] unattributed=%u coverage{instr=%llu uninstr=%llu unrecorded=%llu reused=%llu wraps=%llu} "
-           "host_advanced_ms=%lld proc_cpu_ms=%lld acct=%d%% threads=%u%s ioctl_ticks=%llu top5=[%s]\n",
+           "waited_unresolved=%u cbs_retired=%u[%s] window=%llu coverage{instr=%llu uninstr=%llu unrecorded=%llu "
+           "reused=%llu slotless=%llu cap=%u} host_advanced_ms=%lld proc_cpu_ms=%lld acct=%d%% threads=%u%s "
+           "ioctl_ticks=%llu window_left=%d top5=[%s]\n",
            (unsigned long long)(wait_ns / 1000000ull), (unsigned long long)waited_submit, (long long)span_ms,
-           span_missing_end, span_recs, retired, ids, unattributed, (unsigned long long)xlat_rec_next,
-           (unsigned long long)xlat_uninstrumented, (unsigned long long)xlat_unrecorded,
-           (unsigned long long)xlat_reused, (unsigned long long)xlat_wraps, (long long)host_adv_ms,
-           (long long)proc_cpu_ms, acct, xlat_wait_now.n, xlat_wait_now.truncated ? "(truncated)" : "",
-           (unsigned long long)ioctl_ticks, list);
+           span_missing_end, span_recs, waited_unresolved, retired, ids, (unsigned long long)w->n,
+           (unsigned long long)xlat_rec_next, (unsigned long long)xlat_uninstrumented,
+           (unsigned long long)xlat_unrecorded, (unsigned long long)xlat_reused, (unsigned long long)xlat_slotless,
+           XLAT_REC_CAP, (long long)host_adv_ms, (long long)proc_cpu_ms, acct, xlat_wait_now.n,
+           xlat_wait_now.truncated ? "(truncated)" : "", (unsigned long long)ioctl_ticks, window_left, list);
+
+   if (window_left > 0) {
+      window_left--;
+      __atomic_store_n(&xlat_window_left, window_left, __ATOMIC_RELAXED);
+      if (window_left == 0)
+         fprintf(stderr, "radv: xclipse: lat window close #%u (budget spent)\n", xlat_window_opened);
+   }
 
    atomic_store(&xlat_wait_active, false);
 }
